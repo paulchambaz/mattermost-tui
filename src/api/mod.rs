@@ -436,6 +436,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn posts_ask_for_the_page_before_a_post() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v4/channels/c1/posts"))
+            .and(wiremock::matchers::query_param("before", "p9"))
+            .and(wiremock::matchers::query_param("per_page", "20"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"order": [], "posts": {}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = Client::connect(&server.uri(), Credentials::Token("t".into()), None)
+            .await
+            .unwrap();
+        let list = client
+            .posts(&ChannelId("c1".into()), Some(&PostId("p9".into())), 20)
+            .await
+            .unwrap();
+        assert!(list.order.is_empty());
+    }
+
+    #[tokio::test]
     async fn users_posts_ids() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))

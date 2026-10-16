@@ -11,6 +11,10 @@ use crate::api::types::{
 };
 use crate::api::Client;
 
+/// Posts asked for at a time.
+pub const PAGE: usize = 60;
+/// Most messages kept for one channel.
+pub const MAX_MESSAGES: usize = 500;
 const GROUP_WINDOW_MS: i64 = 5 * 60 * 1000;
 const PALETTE: [u8; 12] = [1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 14];
 
@@ -91,6 +95,36 @@ pub fn insert_message(list: &mut Vec<Message>, message: Message) {
             list.insert(at, message);
         }
     }
+}
+
+/// Adds a page of messages, replacing the ones already known by id.
+pub fn merge_page(list: &mut Vec<Message>, page: Vec<Message>) {
+    for message in page {
+        insert_message(list, message);
+    }
+}
+
+/// Puts the newest page in place of what was known for the same time span.
+/// Returns false when it does not meet the known messages, which are then dropped as stale.
+pub fn replace_window(list: &mut Vec<Message>, page: Vec<Message>) -> bool {
+    let (Some(first), Some(last)) = (page.first().map(|m| m.ms), page.last().map(|m| m.ms)) else {
+        list.clear();
+        return false;
+    };
+    let meets = list.last().is_none_or(|known| known.ms >= first);
+    if !meets {
+        list.clear();
+    }
+    list.retain(|m| m.ms < first || m.ms > last);
+    merge_page(list, page);
+    meets
+}
+
+/// Drops the oldest messages beyond `max` and says how many went.
+pub fn cap(list: &mut Vec<Message>, max: usize) -> usize {
+    let extra = list.len().saturating_sub(max);
+    list.drain(..extra);
+    extra
 }
 
 /// Applies an edited post, keeping the reactions already known.
@@ -286,6 +320,8 @@ pub struct Server {
     pub messages: HashMap<ChannelId, Vec<Message>>,
     pub loading: HashSet<ChannelId>,
     pub refreshed: HashSet<ChannelId>,
+    pub complete: HashSet<ChannelId>,
+    pub paging: HashSet<ChannelId>,
     pub link: Link,
 }
 
@@ -302,6 +338,8 @@ impl Server {
             messages: HashMap::new(),
             loading: HashSet::new(),
             refreshed: HashSet::new(),
+            complete: HashSet::new(),
+            paging: HashSet::new(),
             link: Link::Connecting,
         }
     }
@@ -327,6 +365,16 @@ impl Server {
                 Some(other) => format!("@{}", self.username(&other)),
                 None => "@…".into(),
             },
+        }
+    }
+
+    /// Keeps only the newest page of a channel that is no longer open.
+    pub fn trim(&mut self, channel: &ChannelId) {
+        let Some(list) = self.messages.get_mut(channel) else {
+            return;
+        };
+        if cap(list, PAGE) > 0 {
+            self.complete.remove(channel);
         }
     }
 
@@ -572,5 +620,72 @@ mod tests {
         unreact(&mut list, &reaction("u1", "p10", "+1"));
         assert_eq!(list[0].reactions.len(), 1);
         assert_eq!(list[0].reactions[0].users, [UserId("u2".into())]);
+    }
+
+    fn ms_of(list: &[Message]) -> Vec<i64> {
+        list.iter().map(|m| m.ms).collect()
+    }
+
+    #[test]
+    fn pages_merge_in_order_without_duplicates() {
+        let mut list = vec![msg("a", 30), msg("a", 40)];
+        merge_page(&mut list, vec![msg("a", 10), msg("a", 20), msg("a", 30)]);
+        merge_page(&mut list, vec![msg("a", 10), msg("a", 20)]);
+        assert_eq!(ms_of(&list), [10, 20, 30, 40]);
+    }
+
+    #[test]
+    fn the_newest_page_replaces_its_window_and_keeps_older_history() {
+        let mut list = vec![
+            msg("a", 10),
+            msg("a", 20),
+            msg("a", 30),
+            msg("a", 40),
+            msg("a", 50),
+        ];
+        let kept = replace_window(&mut list, vec![msg("a", 30), msg("a", 50), msg("a", 60)]);
+        assert!(kept);
+        assert_eq!(ms_of(&list), [10, 20, 30, 50, 60]);
+    }
+
+    #[test]
+    fn a_window_that_misses_the_known_messages_starts_over() {
+        let mut list = vec![msg("a", 10), msg("a", 20)];
+        assert!(!replace_window(
+            &mut list,
+            vec![msg("a", 90), msg("a", 100)]
+        ));
+        assert_eq!(ms_of(&list), [90, 100]);
+        assert!(!replace_window(&mut list, vec![]));
+        assert!(list.is_empty());
+    }
+
+    #[test]
+    fn newer_live_posts_survive_a_refresh() {
+        let mut list = vec![msg("a", 10), msg("a", 20), msg("a", 70)];
+        replace_window(&mut list, vec![msg("a", 10), msg("a", 20), msg("a", 30)]);
+        assert_eq!(ms_of(&list), [10, 20, 30, 70]);
+    }
+
+    #[test]
+    fn the_cap_drops_the_oldest_and_trim_forgets_completeness() {
+        let mut list: Vec<Message> = (1..=5).map(|i| msg("a", i)).collect();
+        assert_eq!(cap(&mut list, 3), 2);
+        assert_eq!(ms_of(&list), [3, 4, 5]);
+        assert_eq!(cap(&mut list, 3), 0);
+        let mut server = Server::new("work".into());
+        let id = ChannelId("c".into());
+        server
+            .messages
+            .insert(id.clone(), (1..=100).map(|i| msg("a", i)).collect());
+        server.complete.insert(id.clone());
+        server.trim(&id);
+        assert_eq!(server.messages[&id].len(), PAGE);
+        assert_eq!(server.messages[&id][0].ms, 41);
+        assert!(!server.complete.contains(&id));
+        server.messages.insert(id.clone(), vec![msg("a", 1)]);
+        server.complete.insert(id.clone());
+        server.trim(&id);
+        assert!(server.complete.contains(&id));
     }
 }

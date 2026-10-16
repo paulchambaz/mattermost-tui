@@ -8,8 +8,8 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::api::types::{
-    CategoryList, Channel, ChannelId, ChannelMember, PostList, Team as WireTeam, TeamId, User,
-    UserId,
+    CategoryList, Channel, ChannelId, ChannelMember, PostId, PostList, Team as WireTeam, TeamId,
+    User, UserId,
 };
 use crate::api::{Client, Error};
 use crate::config::{self, Credentials, ServerConfig};
@@ -17,8 +17,6 @@ use crate::input::{self, Command, Line, Step, Wizard};
 use crate::model::{self, group_start, group_with_previous, Link, Message, Server, Team};
 use crate::unread;
 use crate::ws::{self, Event, Ws};
-
-const POSTS_PER_PAGE: u32 = 60;
 
 /// Everything that can wake the application.
 #[derive(Debug)]
@@ -44,6 +42,12 @@ pub enum Loaded {
     Posts {
         channel: ChannelId,
         list: PostList,
+    },
+    Older {
+        channel: ChannelId,
+        before: PostId,
+        list: Result<PostList, String>,
+        asked: usize,
     },
     Users(Vec<User>),
     Viewed,
@@ -210,7 +214,10 @@ impl App {
             '?' => self.help = Some(0),
             'j' => self.step_down(),
             'k' => self.step_up(),
-            'g' => self.move_cursor(0),
+            'g' => {
+                self.move_cursor(0);
+                self.load_older();
+            }
             'G' => self.move_cursor(usize::MAX),
             'a' => self.reactions = !self.reactions,
             'n' => self.next_unread(),
@@ -357,10 +364,55 @@ impl App {
     }
 
     fn step_up(&mut self) {
-        match self.browsing {
-            true => self.move_cursor(self.cursor.saturating_sub(1)),
-            false => self.browsing = self.count() > 0,
+        match (self.browsing, self.cursor) {
+            (true, 0) => self.load_older(),
+            (true, c) => self.move_cursor(c - 1),
+            (false, _) => self.browsing = self.count() > 0,
         }
+    }
+
+    fn load_older(&mut self) {
+        if self.cursor != 0 {
+            return;
+        }
+        let Some((server, chan)) = self.channel() else {
+            return;
+        };
+        let id = chan.info.id.clone();
+        let Some(messages) = server.messages.get(&id) else {
+            return;
+        };
+        let (Some(before), len) = (messages.first().map(|m| m.id.clone()), messages.len()) else {
+            return;
+        };
+        if server.complete.contains(&id) {
+            self.notice = "Start of the channel".into();
+            return;
+        }
+        if len >= model::MAX_MESSAGES {
+            self.notice = format!("Showing the last {} messages", model::MAX_MESSAGES);
+            return;
+        }
+        let asked = model::PAGE.min(model::MAX_MESSAGES - len);
+        let Some(server) = self.servers.get_mut(self.server) else {
+            return;
+        };
+        let Some(client) = server.client.clone() else {
+            return;
+        };
+        if !server.paging.insert(id.clone()) {
+            return;
+        }
+        self.notice = "Loading older messages…".into();
+        self.spawn(self.server, async move {
+            let list = client.posts(&id, Some(&before), asked as u32).await;
+            Loaded::Older {
+                channel: id,
+                before,
+                list: list.map_err(|e| e.to_string()),
+                asked,
+            }
+        });
     }
 
     fn step_down(&mut self) {
@@ -505,16 +557,64 @@ impl App {
                 let messages = model::messages_of(&list);
                 let ids = server.unknown(messages.iter().map(|m| &m.user));
                 server.loading.remove(&channel);
-                if current.as_ref() == Some(&channel) && self.browsing {
-                    let old = server
-                        .messages
-                        .get(&channel)
-                        .and_then(|m| m.get(self.cursor));
-                    let at = old.and_then(|o| messages.iter().position(|m| m.id == o.id));
-                    self.cursor = at.unwrap_or(self.cursor);
+                let selected = (current.as_ref() == Some(&channel) && self.browsing)
+                    .then(|| server.messages.get(&channel)?.get(self.cursor))
+                    .flatten()
+                    .map(|m| m.id.clone());
+                let cached = server.messages.entry(channel.clone()).or_default();
+                let kept = model::replace_window(cached, messages);
+                if let Some(at) = selected.and_then(|id| cached.iter().position(|m| m.id == id)) {
+                    self.cursor = at;
                 }
-                server.messages.insert(channel, messages);
+                if !kept {
+                    server.complete.remove(&channel);
+                }
+                if list.order.len() < model::PAGE {
+                    server.complete.insert(channel);
+                }
                 self.fetch_users(i, ids);
+            }
+            Loaded::Older {
+                channel,
+                before,
+                list,
+                asked,
+            } => {
+                server.paging.remove(&channel);
+                match list {
+                    Err(e) => self.notice = format!("{}: {e}", server.name),
+                    Ok(list) => {
+                        let page = model::messages_of(&list);
+                        let ids = server.unknown(page.iter().map(|m| &m.user));
+                        let intact = server
+                            .messages
+                            .get(&channel)
+                            .and_then(|m| m.first())
+                            .is_some_and(|m| m.id == before);
+                        if intact {
+                            if list.order.len() < asked {
+                                server.complete.insert(channel.clone());
+                            }
+                            let here = current.as_ref() == Some(&channel);
+                            let cached = server.messages.entry(channel).or_default();
+                            let selected = here
+                                .then(|| cached.get(self.cursor))
+                                .flatten()
+                                .map(|m| m.id.clone());
+                            model::merge_page(cached, page);
+                            if let Some(id) = selected {
+                                let at = cached.iter().position(|m| m.id == id).unwrap_or(0);
+                                self.cursor = if id == before {
+                                    at.saturating_sub(1)
+                                } else {
+                                    at
+                                };
+                                self.follow = true;
+                            }
+                        }
+                        self.fetch_users(i, ids);
+                    }
+                }
             }
             Loaded::Viewed => {}
             Loaded::Users(users) => {
@@ -559,6 +659,7 @@ impl App {
             return;
         };
         server.messages.retain(|id, _| Some(id) == current.as_ref());
+        server.complete.retain(|id| Some(id) == current.as_ref());
         self.refresh_channels(i);
         if let Some(id) = current {
             self.fetch_posts(i, id);
@@ -584,6 +685,7 @@ impl App {
         };
         let me = server.me.as_ref().map(|m| m.id.clone());
         let (mut touched, mut removed, mut refresh, mut view) = (None, None, false, None);
+        let (mut added, mut dropped) = (false, 0);
         let mut ids = Vec::new();
         match event {
             Event::Posted { post, mentions } => {
@@ -609,7 +711,12 @@ impl App {
                 refresh = !known && server.refreshed.insert(channel.clone());
                 ids = server.unknown(std::iter::once(&post.user_id));
                 if let Some(list) = server.messages.get_mut(&channel) {
+                    added = list.iter().all(|m| m.id != post.id);
                     model::insert_message(list, Message::from_post(&post));
+                    dropped = model::cap(list, model::MAX_MESSAGES);
+                }
+                if dropped > 0 {
+                    server.complete.remove(&channel);
                 }
                 touched = Some(channel);
             }
@@ -652,14 +759,14 @@ impl App {
                     self.cursor = self.cursor.saturating_sub(usize::from(at < self.cursor));
                     self.cursor = self.cursor.min(after.saturating_sub(1));
                 }
-                None if after > before && at_end => {
+                None if added && at_end => {
                     self.cursor = after - 1;
                     match self.browsing {
                         true => self.follow = true,
                         false => self.scroll = usize::MAX,
                     }
                 }
-                None => {}
+                None => self.cursor = self.cursor.saturating_sub(dropped),
             }
         }
         if i == self.server {
@@ -708,11 +815,13 @@ impl App {
         if self.entry.as_ref().is_some_and(same) {
             return;
         }
-        let prev = self
-            .entry
-            .take()
-            .filter(|e| e.server == self.server)
-            .map(|e| e.channel);
+        let old = self.entry.take();
+        if let Some(e) = &old {
+            if let Some(server) = self.servers.get_mut(e.server) {
+                server.trim(&e.channel);
+            }
+        }
+        let prev = old.filter(|e| e.server == self.server).map(|e| e.channel);
         let goal = std::mem::take(&mut self.goal);
         self.entry = Some(Entry {
             server: self.server,
@@ -875,7 +984,7 @@ impl App {
             return;
         }
         self.spawn(i, async move {
-            match client.posts(&id, None, POSTS_PER_PAGE).await {
+            match client.posts(&id, None, model::PAGE as u32).await {
                 Ok(list) => Loaded::Posts { channel: id, list },
                 Err(e) => Loaded::Failed(e.to_string()),
             }
@@ -1394,9 +1503,10 @@ pub mod tests {
         requests
             .iter()
             .map(|r| {
+                let query = r.url.query().map_or(String::new(), |q| format!("?{q}"));
                 (
                     r.method.to_string(),
-                    r.url.path().to_owned(),
+                    format!("{}{query}", r.url.path()),
                     String::from_utf8_lossy(&r.body).into_owned(),
                 )
             })
@@ -1446,7 +1556,7 @@ pub mod tests {
     #[tokio::test]
     async fn a_whole_session_only_reads_and_views() {
         let (mut app, server) = live().await;
-        press(&mut app, "JnNcKjkgGwb?q");
+        press(&mut app, "JnNcKjkgGwb?qkkgg");
         posted(
             &mut app,
             post("p40", "c1", "u2", "@paul hi", 1_700_000_900_000),
@@ -1494,5 +1604,188 @@ pub mod tests {
             .ends_with("offline  2/2  100%  ? help"));
         app.ws(0, Ws::Up { resync: false });
         assert!(!screen(&mut app, 80, 14).last().unwrap().contains("offline"));
+    }
+
+    fn page(posts: &[(&str, i64)]) -> PostList {
+        let order: Vec<&str> = posts.iter().rev().map(|(id, _)| *id).collect();
+        let posts: serde_json::Map<String, serde_json::Value> = posts
+            .iter()
+            .map(|(id, ms)| {
+                let post = serde_json::json!({
+                    "id": id, "create_at": ms, "user_id": "u2", "channel_id": "c3", "message": id
+                });
+                ((*id).to_owned(), post)
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({"order": order, "posts": posts})).unwrap()
+    }
+
+    fn older(app: &mut App, before: &str, posts: &[(&str, i64)], asked: usize) {
+        app.loaded(
+            0,
+            Loaded::Older {
+                channel: ChannelId("c3".into()),
+                before: PostId(before.into()),
+                list: Ok(page(posts)),
+                asked,
+            },
+        );
+    }
+
+    fn ids(app: &App) -> Vec<String> {
+        app.messages()
+            .unwrap()
+            .iter()
+            .map(|m| m.id.0.clone())
+            .collect()
+    }
+
+    const OLD: [(&str, i64); 2] = [("o1", 1_699_999_000_000), ("o2", 1_699_999_100_000)];
+
+    #[test]
+    fn an_older_page_lands_the_cursor_above_the_old_top_or_keeps_it_on_its_message() {
+        let mut app = fixture();
+        press(&mut app, "kk");
+        assert_eq!(app.cursor, 0);
+        older(&mut app, "p1", &OLD, 60);
+        assert_eq!(ids(&app), ["o1", "o2", "p1", "p2"]);
+        assert_eq!(app.cursor, 1);
+
+        let mut app = fixture();
+        press(&mut app, "k");
+        older(&mut app, "p1", &OLD, 60);
+        assert_eq!(app.cursor, 3);
+    }
+
+    #[test]
+    fn overlapping_and_stale_pages_change_nothing_wrong() {
+        let mut app = fixture();
+        older(&mut app, "p1", &[OLD[0], ("p1", 1_700_000_000_000)], 60);
+        assert_eq!(ids(&app), ["o1", "p1", "p2"]);
+        older(&mut app, "p1", &[OLD[1]], 60);
+        assert_eq!(ids(&app), ["o1", "p1", "p2"]);
+    }
+
+    #[test]
+    fn a_short_page_ends_the_history() {
+        let mut app = fixture();
+        app.servers[0].complete.clear();
+        older(&mut app, "p1", &OLD, 60);
+        assert!(text(&mut app).contains("Start of +Secret"));
+        press(&mut app, "kkkkk");
+        assert_eq!(app.notice, "Start of the channel");
+    }
+
+    #[test]
+    fn a_full_page_leaves_the_history_open_and_a_failed_one_can_be_retried() {
+        let mut app = fixture();
+        app.servers[0].complete.clear();
+        app.servers[0].paging.insert(ChannelId("c3".into()));
+        older(&mut app, "p1", &OLD, 2);
+        assert!(!app.servers[0].complete.contains(&ChannelId("c3".into())));
+        app.servers[0].paging.insert(ChannelId("c3".into()));
+        app.loaded(
+            0,
+            Loaded::Older {
+                channel: ChannelId("c3".into()),
+                before: PostId("o1".into()),
+                list: Err("timeout".into()),
+                asked: 60,
+            },
+        );
+        assert!(app.servers[0].paging.is_empty());
+        assert_eq!(app.notice, "work: timeout");
+    }
+
+    #[test]
+    fn a_refresh_of_the_newest_page_keeps_the_older_history() {
+        let mut app = fixture();
+        older(&mut app, "p1", &OLD, 60);
+        let list: PostList = json("posts");
+        app.loaded(
+            0,
+            Loaded::Posts {
+                channel: ChannelId("c3".into()),
+                list,
+            },
+        );
+        assert_eq!(ids(&app), ["o1", "o2", "p1", "p2"]);
+    }
+
+    fn crowd(app: &mut App, count: usize) {
+        let base = 1_600_000_000_000;
+        let list = (0..count)
+            .map(|n| {
+                Message::from_post(&post(
+                    &format!("m{n}"),
+                    "c3",
+                    "u2",
+                    "x",
+                    base + n as i64 * 1000,
+                ))
+            })
+            .collect();
+        app.servers[0].messages.insert(ChannelId("c3".into()), list);
+        app.servers[0].complete.clear();
+    }
+
+    #[test]
+    fn a_live_post_over_the_cap_drops_the_oldest_and_keeps_the_cursor_on_its_message() {
+        let mut app = fixture();
+        crowd(&mut app, 500);
+        (app.browsing, app.cursor) = (true, 10);
+        posted(
+            &mut app,
+            post("new", "c3", "u2", "x", 1_700_000_000_000),
+            &[],
+        );
+        assert_eq!((app.count(), app.cursor), (500, 9));
+        assert_eq!(app.messages().unwrap()[0].id.0, "m1");
+    }
+
+    #[test]
+    fn leaving_a_long_channel_trims_it_to_the_newest_page() {
+        let mut app = fixture();
+        crowd(&mut app, 100);
+        app.servers[0].complete.insert(ChannelId("c3".into()));
+        press(&mut app, "J");
+        let id = ChannelId("c3".into());
+        assert_eq!(app.servers[0].messages[&id].len(), model::PAGE);
+        assert!(!app.servers[0].complete.contains(&id));
+    }
+
+    fn older_requests(sent: &[(String, String, String)]) -> Vec<String> {
+        sent.iter()
+            .filter(|(_, path, _)| path.contains("before="))
+            .map(|(_, path, _)| path.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn k_at_the_top_asks_once_for_the_page_before_the_oldest() {
+        let (mut app, server) = live().await;
+        app.servers[0].complete.clear();
+        press(&mut app, "kkk");
+        assert_eq!(app.notice, "Loading older messages…");
+        press(&mut app, "k");
+        let sent = sent(&server).await;
+        let asked = older_requests(&sent);
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        assert!(asked[0].starts_with("/api/v4/channels/c3/posts?"));
+        assert!(asked[0].contains("before=p1") && asked[0].contains("per_page=60"));
+    }
+
+    #[tokio::test]
+    async fn the_cap_stops_paging_and_the_last_page_is_only_as_big_as_what_fits() {
+        let (mut app, server) = live().await;
+        crowd(&mut app, 500);
+        (app.browsing, app.cursor) = (true, 0);
+        press(&mut app, "k");
+        assert_eq!(app.notice, "Showing the last 500 messages");
+        assert!(older_requests(&sent(&server).await).is_empty());
+        crowd(&mut app, 480);
+        press(&mut app, "k");
+        let asked = older_requests(&sent(&server).await);
+        assert!(asked[0].contains("per_page=20"), "{asked:?}");
     }
 }

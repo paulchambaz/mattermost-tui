@@ -18,8 +18,11 @@ const NICK: usize = 16;
 const MIN_TEXT: usize = 10;
 
 const BINDINGS: &[(&str, &str)] = &[
-    ("j k", "next / previous message"),
-    ("g G", "first / last message"),
+    (
+        "j k",
+        "next / previous message; k at the top loads older ones",
+    ),
+    ("g G", "first / last message; g also loads older ones"),
     ("w b", "next / previous author group"),
     ("J K", "next / previous channel"),
     ("H L", "previous / next team, across servers"),
@@ -264,10 +267,20 @@ fn render_log(app: &App, width: usize) -> Log {
     if messages.is_empty() {
         return notice_log(&format!("No messages in {}", server.label(chan)));
     }
-    messages_log(app, server, messages, width)
+    let start = server
+        .complete
+        .contains(&chan.info.id)
+        .then(|| format!("Start of {}", server.label(chan)));
+    messages_log(app, server, messages, start, width)
 }
 
-fn messages_log(app: &App, server: &Server, messages: &[Message], width: usize) -> Log {
+fn messages_log(
+    app: &App,
+    server: &Server,
+    messages: &[Message],
+    start: Option<String>,
+    width: usize,
+) -> Log {
     let cols = columns(width);
     let now = Local::now();
     let me = server.me.as_ref().map_or("", |u| u.username.as_str());
@@ -278,6 +291,9 @@ fn messages_log(app: &App, server: &Server, messages: &[Message], width: usize) 
         spans: Vec::new(),
     };
 
+    if let Some(start) = start {
+        log.lines.push(separator(&start, muted()));
+    }
     for (i, message) in messages.iter().enumerate() {
         let previous = i.checked_sub(1).map(|p| &messages[p]);
         let start = log.lines.len();
@@ -763,12 +779,12 @@ pub mod tests {
     #[test]
     fn nothing_is_selected_until_a_key_moves() {
         let mut app = fixture();
-        assert!(!has_background(&mut app, 3));
+        assert!(!has_background(&mut app, 4));
         press(&mut app, "k");
-        assert!(has_background(&mut app, 3));
-        assert!(!has_background(&mut app, 2));
-        press(&mut app, "jj");
+        assert!(has_background(&mut app, 4));
         assert!(!has_background(&mut app, 3));
+        press(&mut app, "jj");
+        assert!(!has_background(&mut app, 4));
     }
 
     #[test]
