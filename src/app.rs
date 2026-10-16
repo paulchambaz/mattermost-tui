@@ -207,6 +207,8 @@ pub struct App {
     pub follow: bool,
     pub reactions: bool,
     pub scroll: usize,
+    /// Lines the log should scroll at the next draw, which alone knows where the bottom is.
+    pub shift: isize,
     pub notice: String,
     pub input: Option<Line>,
     pub wizard: Option<Wizard>,
@@ -259,6 +261,7 @@ impl App {
             follow: false,
             reactions: false,
             scroll: usize::MAX,
+            shift: 0,
             notice: String::new(),
             input: None,
             wizard: None,
@@ -419,8 +422,10 @@ impl App {
             'q' => self.quit = true,
             ':' => self.input = Some(Line::new(false)),
             '?' => self.help = Some(0),
-            'j' => self.step_down(),
-            'k' => self.step_up(),
+            'h' => self.step_up(),
+            'l' => self.step_down(),
+            'j' => self.shift += 1,
+            'k' => self.shift -= 1,
             'g' => {
                 self.move_cursor(0);
                 self.load_older();
@@ -2267,12 +2272,12 @@ pub mod tests {
     fn first_k_reveals_and_j_from_the_latest_hides() {
         let mut app = fixture();
         assert!(!app.browsing);
-        press(&mut app, "k");
+        press(&mut app, "h");
         assert!(app.browsing);
         assert_eq!(app.cursor, 1);
-        press(&mut app, "k");
+        press(&mut app, "h");
         assert_eq!(app.cursor, 0);
-        press(&mut app, "jj");
+        press(&mut app, "ll");
         assert!(!app.browsing);
     }
 
@@ -2436,7 +2441,7 @@ pub mod tests {
         );
         assert!(text(&mut app).contains("late news"));
         assert_eq!((app.cursor, app.browsing), (2, false));
-        press(&mut app, "kk");
+        press(&mut app, "hh");
         assert_eq!(app.cursor, 1);
         posted(
             &mut app,
@@ -2706,7 +2711,7 @@ pub mod tests {
         assert!(text(&mut app).contains("🎉 1"));
         app.apply_event(0, Event::ReactionRemoved(reaction("u1", "p2")));
         assert!(!text(&mut app).contains("🎉 1"));
-        press(&mut app, "kk");
+        press(&mut app, "hh");
         app.apply_event(
             0,
             Event::Deleted(post("p1", "c3", "u1", "", 1_700_000_000_000)),
@@ -2768,14 +2773,14 @@ pub mod tests {
     #[test]
     fn an_older_page_lands_the_cursor_above_the_old_top_or_keeps_it_on_its_message() {
         let mut app = fixture();
-        press(&mut app, "kk");
+        press(&mut app, "hh");
         assert_eq!(app.cursor, 0);
         older(&mut app, "p1", &OLD, 60);
         assert_eq!(ids(&app), ["o1", "o2", "p1", "p2"]);
         assert_eq!(app.cursor, 1);
 
         let mut app = fixture();
-        press(&mut app, "k");
+        press(&mut app, "h");
         older(&mut app, "p1", &OLD, 60);
         assert_eq!(app.cursor, 3);
     }
@@ -2795,7 +2800,7 @@ pub mod tests {
         app.servers[0].complete.clear();
         older(&mut app, "p1", &OLD, 60);
         assert!(text(&mut app).contains("Start of +Secret"));
-        press(&mut app, "kkkkk");
+        press(&mut app, "hhhhh");
         assert_eq!(app.notice, "Start of the channel");
     }
 
@@ -2889,9 +2894,9 @@ pub mod tests {
     async fn k_at_the_top_asks_once_for_the_page_before_the_oldest() {
         let (mut app, server) = live().await;
         app.servers[0].complete.clear();
-        press(&mut app, "kkk");
+        press(&mut app, "hhh");
         assert_eq!(app.notice, "Loading older messages…");
-        press(&mut app, "k");
+        press(&mut app, "h");
         let sent = sent(&server).await;
         let asked = older_requests(&sent);
         assert_eq!(asked.len(), 1, "{asked:?}");
@@ -2905,11 +2910,11 @@ pub mod tests {
         let (mut app, server) = live().await;
         crowd(&mut app, 500);
         (app.browsing, app.cursor) = (true, 0);
-        press(&mut app, "k");
+        press(&mut app, "h");
         assert_eq!(app.notice, "Showing the last 500 messages");
         assert!(older_requests(&sent(&server).await).is_empty());
         crowd(&mut app, 480);
-        press(&mut app, "k");
+        press(&mut app, "h");
         let asked = older_requests(&sent(&server).await);
         assert!(asked[0].contains("per_page=20"), "{asked:?}");
     }
@@ -3661,13 +3666,13 @@ pub mod tests {
         press(&mut app, "Y");
         assert_eq!(app.register, format!("[{time}] ana: hi"));
         (app.cursor, app.browsing) = (0, true);
-        press(&mut app, "Vj");
+        press(&mut app, "Vl");
         assert_eq!(app.mode(), "VISUAL");
         press(&mut app, "y");
         assert_eq!(app.register, "hello :tada:\nhi");
         assert_eq!(app.notice, "Copied 2 messages");
         assert_eq!(app.mode(), "NORMAL");
-        press(&mut app, "Vj");
+        press(&mut app, "Vl");
         press_code(&mut app, KeyCode::Esc);
         assert_eq!(app.mode(), "NORMAL");
     }
@@ -3679,7 +3684,7 @@ pub mod tests {
         assert_eq!(app.notice, "Nothing to paste: copy a message with y first");
         assert!(app.compose.is_none());
         (app.cursor, app.browsing) = (0, true);
-        press(&mut app, "Vjy");
+        press(&mut app, "Vly");
         press(&mut app, "p");
         assert_eq!(app.mode(), "INSERT");
         assert_eq!(

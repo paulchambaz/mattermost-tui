@@ -49,9 +49,13 @@ Press *?* at any time for the list of keys.
 
 # KEYS
 
-*j k*
-	Next and previous message. At the top of the channel, *k* loads older
+*l h*
+	Next and previous message. At the top of the channel, *h* loads older
 	messages.
+
+*j k*
+	Scroll the log down and up by a line, without moving the selected
+	message.
 
 *g G*
 	First and last message. *g* also loads older messages.
@@ -111,7 +115,7 @@ Press *?* at any time for the list of keys.
 	is turned on for you.
 
 *V*
-	Select a range of messages, then *j* and *k* extend it.
+	Select a range of messages, then *h* and *l* extend it.
 
 *y Y*
 	Copy the selected message or range. *Y* adds the author and the time of

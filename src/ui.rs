@@ -29,9 +29,10 @@ const USERS_MIN_WIDTH: u16 = 70;
 
 const BINDINGS: &[(&str, &str)] = &[
     (
-        "j k",
-        "next / previous message; k at the top loads older ones",
+        "l h",
+        "next / previous message; h at the top loads older ones",
     ),
+    ("j k", "scroll the log down / up by a line"),
     ("g G", "first / last message; g also loads older ones"),
     ("w b", "next / previous author group"),
     ("J K", "next / previous channel"),
@@ -58,7 +59,7 @@ const BINDINGS: &[(&str, &str)] = &[
         "x X",
         "react to the selected message (x: pick 1-9, X: the same again)",
     ),
-    ("V", "select a range of messages, j k extend it"),
+    ("V", "select a range of messages, h l extend it"),
     ("y Y", "copy the message or range (Y: with author and time)"),
     ("p", "paste what was copied into the input"),
     ("m", "users column: scroll it with j k, m again hides it"),
@@ -975,6 +976,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             }
             app.follow = false;
         }
+        if app.shift != 0 {
+            scroll = scroll.saturating_add_signed(app.shift).min(bottom);
+            app.scroll = scroll;
+            app.shift = 0;
+        }
         percent = (scroll * 100).checked_div(bottom).unwrap_or(100);
         let page: Vec<Line> = log.lines.into_iter().skip(scroll).take(height).collect();
         frame.render_widget(Paragraph::new(page), body);
@@ -1295,10 +1301,10 @@ pub mod tests {
     fn nothing_is_selected_until_a_key_moves() {
         let mut app = fixture();
         assert!(!has_background(&mut app, 4));
-        press(&mut app, "k");
+        press(&mut app, "h");
         assert!(has_background(&mut app, 4));
         assert!(!has_background(&mut app, 3));
-        press(&mut app, "jj");
+        press(&mut app, "ll");
         assert!(!has_background(&mut app, 4));
     }
 
@@ -1310,6 +1316,24 @@ pub mod tests {
         assert!(from_end(&lines, 1).contains("> @ana"));
         let narrow = screen(&mut app, 34, 12);
         assert!(narrow[0].contains("@ana"), "{:?}", narrow[0]);
+    }
+
+    #[test]
+    fn j_and_k_scroll_the_log_without_moving_the_selection() {
+        let mut app = fixture();
+        screen(&mut app, 60, 4);
+        let (cursor, browsing) = (app.cursor, app.browsing);
+        press(&mut app, "j");
+        screen(&mut app, 60, 4);
+        let bottom = app.scroll;
+        assert_ne!(bottom, usize::MAX);
+        press(&mut app, "k");
+        screen(&mut app, 60, 4);
+        assert_eq!(app.scroll, bottom.saturating_sub(1));
+        press(&mut app, "kk");
+        screen(&mut app, 60, 4);
+        assert_eq!(app.scroll, bottom.saturating_sub(3));
+        assert_eq!((app.cursor, app.browsing), (cursor, browsing));
     }
 
     #[test]
@@ -1461,7 +1485,7 @@ pub mod tests {
         assert!(row.starts_with(" REACT  1 👍"), "{row:?}");
         assert!(row.contains("9 😮"), "{row:?}");
         press(&mut app, "q");
-        press(&mut app, "kkVj");
+        press(&mut app, "hhVl");
         let row = screen(&mut app, 80, 12).pop().unwrap();
         assert!(row.starts_with(" VISUAL"), "{row:?}");
         assert!(has_background(&mut app, 3) && has_background(&mut app, 4));
