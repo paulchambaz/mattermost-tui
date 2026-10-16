@@ -9,6 +9,7 @@ use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::App;
+use crate::finder;
 use crate::model::{self, group_with_previous, Link, Message, Server};
 use crate::unread;
 
@@ -31,8 +32,23 @@ const BINDINGS: &[(&str, &str)] = &[
     ("n", "next unread message, then next unread channel"),
     ("N", "next mention, across all teams and servers"),
     ("c", "mark the open channel as read"),
+    ("f F", "find a channel: f in this team, F everywhere"),
     ("a", "reactions under the messages"),
     ("q", "quit"),
+];
+
+const FINDER: &[(&str, &str)] = &[
+    (
+        "words",
+        "all must match the channel name (F: or the server:team)",
+    ),
+    ("@x", "direct and group messages matching x"),
+    (
+        "a#b",
+        "channel b in the team a; #b any team, a# the team only",
+    ),
+    ("tab, arrows", "choose"),
+    ("enter, esc", "go there, close"),
 ];
 
 const COMMANDS: &[(&str, &str)] = &[
@@ -540,6 +556,115 @@ fn server_down(app: &App) -> bool {
         .is_some_and(|s| s.link == Link::Down)
 }
 
+/// Text in `base`, with the characters at `hits` in `hl`.
+fn highlighted(text: &str, hits: &[usize], base: Style, hl: Style) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut run = String::new();
+    let mut marked = false;
+    for (i, c) in text.chars().enumerate() {
+        if hits.contains(&i) != marked && !run.is_empty() {
+            spans.push(Span::styled(
+                std::mem::take(&mut run),
+                if marked { hl } else { base },
+            ));
+        }
+        marked = hits.contains(&i);
+        run.push(c);
+    }
+    if !run.is_empty() {
+        spans.push(Span::styled(run, if marked { hl } else { base }));
+    }
+    spans
+}
+
+/// The matches of the finder on one line: the count, the channels side by side, and the scope.
+fn wildmenu(app: &App, width: usize) -> Line<'static> {
+    let Some(finder) = &app.finder else {
+        return Line::default();
+    };
+    let line = Style::new().add_modifier(Modifier::REVERSED);
+    let mode = Span::styled(" SEARCH ", line);
+    let text = finder.line.text();
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let candidates = finder::candidates(&app.servers, (app.server, app.team), finder.all);
+    let found = finder::entries(&words, &candidates, finder.all);
+    if found.is_empty() {
+        let rest = width.saturating_sub(mode.width());
+        return Line::from(vec![
+            mode,
+            Span::styled(pad_right(" no result", rest), line),
+        ]);
+    }
+
+    let selected = finder.selected.min(found.len() - 1);
+    let chip = Span::styled(format!(" {}/{} ", selected + 1, found.len()), line);
+    let chosen = found[selected].candidate;
+    let scope = match (finder.all, chosen.direct()) {
+        (false, _) => " this team ".to_owned(),
+        (true, true) => " ".to_owned(),
+        (true, false) => format!(" {} ", truncate(&chosen.scope, (width / 3).max(8))),
+    };
+    let scope = Span::styled(scope, line);
+
+    let items: Vec<Vec<Span<'static>>> = found
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            let candidate = entry.candidate;
+            let mut base = line;
+            if candidate.unread {
+                base = base.add_modifier(Modifier::BOLD);
+            }
+            let mut hl = base.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+            if i == selected {
+                base = Style::new()
+                    .bg(Color::Indexed(3))
+                    .fg(Color::Indexed(0))
+                    .add_modifier(Modifier::BOLD);
+                hl = base.add_modifier(Modifier::UNDERLINED);
+            }
+            let mut spans = vec![Span::styled(" ", base)];
+            if finder.all && !candidate.direct() {
+                let scope = truncate(&candidate.scope, 14);
+                spans.extend(highlighted(&scope, &entry.scope_hits, base, hl));
+            }
+            spans.push(Span::styled(model::glyph(candidate.kind).to_string(), base));
+            spans.extend(highlighted(&candidate.name, &entry.name_hits, base, hl));
+            spans.push(Span::styled(" ", base));
+            spans
+        })
+        .collect();
+    let widths: Vec<usize> = items
+        .iter()
+        .map(|spans| spans.iter().map(Span::width).sum())
+        .collect();
+
+    let room = width
+        .saturating_sub(chip.width() + scope.width() + 2)
+        .max(1);
+    let first = first_visible(&widths, selected, room);
+    let (mut used, mut last) = (0, first);
+    let mut menu = Vec::new();
+    for (i, spans) in items.into_iter().enumerate().skip(first) {
+        if used + widths[i] > room {
+            break;
+        }
+        used += widths[i];
+        last = i;
+        menu.extend(spans);
+    }
+
+    let left = Span::styled(if first > 0 { "‹" } else { " " }, line);
+    let right = Span::styled(if last + 1 < found.len() { "›" } else { " " }, line);
+    let gap = width.saturating_sub(mode.width() + chip.width() + 2 + used + scope.width());
+    let mut spans = vec![mode, chip, left];
+    spans.extend(menu);
+    spans.push(right);
+    spans.push(Span::styled(" ".repeat(gap), line));
+    spans.push(scope);
+    Line::from(spans)
+}
+
 fn help_lines() -> Vec<Line<'static>> {
     let section = |title: &str, rows: &[(&str, &str)]| {
         let heading = Line::styled(
@@ -556,6 +681,7 @@ fn help_lines() -> Vec<Line<'static>> {
     };
     [
         section("Keys", BINDINGS),
+        section("Finder", FINDER),
         section("Commands (type : first)", COMMANDS),
     ]
     .concat()
@@ -614,8 +740,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         frame.render_widget(Paragraph::new(page), body);
     }
 
-    if let Some(line) = &app.input {
-        let prompt = app.prompt();
+    let typing = match (&app.finder, &app.input) {
+        (Some(finder), _) => Some(("find> ", &finder.line)),
+        (_, Some(line)) => Some((app.prompt(), line)),
+        _ => None,
+    };
+    if let Some((prompt, line)) = typing {
         let shown = line.shown();
         let before: String = shown.chars().take(line.cursor()).collect();
         frame.render_widget(Paragraph::new(format!(" {prompt}{shown}")), input);
@@ -625,7 +755,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             input.y,
         ));
     }
-    frame.render_widget(Paragraph::new(status_line(app, width, percent)), status);
+    let bottom = match app.finder {
+        Some(_) => wildmenu(app, width),
+        None => status_line(app, width, percent),
+    };
+    frame.render_widget(Paragraph::new(bottom), status);
 }
 
 #[cfg(test)]
@@ -839,5 +973,50 @@ pub mod tests {
         let lines = screen(&mut app, 60, 12);
         assert_eq!(from_end(&lines, 2), " Password: ••••••");
         assert!(from_end(&lines, 1).starts_with(" LOGIN"));
+    }
+
+    #[test]
+    fn the_wildmenu_fills_the_last_row_and_the_query_the_one_above() {
+        let mut app = fixture();
+        press(&mut app, "f");
+        let lines = screen(&mut app, 80, 12);
+        assert_eq!(from_end(&lines, 2), " find>");
+        let menu = from_end(&lines, 1);
+        assert!(menu.starts_with(" SEARCH  1/3 "), "{menu:?}");
+        assert!(menu.contains("+Secret") && menu.contains("#Town Square") && menu.contains("@ana"));
+        assert!(menu.ends_with("this team"));
+        assert!(has_background(&mut app, 11));
+    }
+
+    #[test]
+    fn typing_narrows_the_menu_and_nothing_matching_says_so() {
+        let mut app = fixture();
+        press(&mut app, "ftown");
+        let lines = screen(&mut app, 80, 12);
+        assert_eq!(from_end(&lines, 2), " find> town");
+        assert!(from_end(&lines, 1).starts_with(" SEARCH  1/1 "));
+        assert!(!from_end(&lines, 1).contains("+Secret"));
+        press(&mut app, "zzz");
+        assert_eq!(from_end(&screen(&mut app, 80, 12), 1), " SEARCH  no result");
+    }
+
+    #[test]
+    fn a_narrow_menu_scrolls_to_keep_the_choice_visible() {
+        let mut app = fixture();
+        press(&mut app, "f");
+        press_code(&mut app, ratatui::crossterm::event::KeyCode::Tab);
+        press_code(&mut app, ratatui::crossterm::event::KeyCode::Tab);
+        let menu = from_end(&screen(&mut app, 36, 12), 1).to_owned();
+        assert!(menu.contains("@ana") && menu.contains('‹'), "{menu:?}");
+        assert!(!menu.contains("+Secret"));
+    }
+
+    #[test]
+    fn everywhere_the_scope_prefixes_the_items_and_ends_the_row() {
+        let mut app = fixture();
+        press(&mut app, "Ftown");
+        let menu = from_end(&screen(&mut app, 80, 12), 1).to_owned();
+        assert!(menu.contains("work:Engineer…#Town Square"), "{menu:?}");
+        assert!(menu.ends_with("work:Engineering"), "{menu:?}");
     }
 }

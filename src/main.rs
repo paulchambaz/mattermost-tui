@@ -3,6 +3,7 @@
 mod api;
 mod app;
 mod config;
+mod finder;
 mod input;
 mod model;
 mod ui;

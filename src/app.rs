@@ -13,6 +13,7 @@ use crate::api::types::{
 };
 use crate::api::{Client, Error};
 use crate::config::{self, Credentials, ServerConfig};
+use crate::finder;
 use crate::input::{self, Command, Line, Step, Wizard};
 use crate::model::{self, group_start, group_with_previous, Link, Message, Server, Team};
 use crate::unread;
@@ -52,6 +53,14 @@ pub enum Loaded {
     Users(Vec<User>),
     Viewed,
     Failed(String),
+}
+
+/// The channel finder: what is being typed and which match is chosen.
+#[derive(Debug)]
+pub struct Finder {
+    pub all: bool,
+    pub line: Line,
+    pub selected: usize,
 }
 
 /// What entering a channel should put under the cursor.
@@ -96,6 +105,7 @@ pub struct App {
     pub input: Option<Line>,
     pub wizard: Option<Wizard>,
     pub help: Option<usize>,
+    pub finder: Option<Finder>,
     pub quit: bool,
     entry: Option<Entry>,
     goal: Goal,
@@ -124,6 +134,7 @@ impl App {
             input: None,
             wizard: None,
             help: None,
+            finder: None,
             quit: false,
             entry: None,
             goal: Goal::Unread,
@@ -155,10 +166,11 @@ impl App {
 
     /// Name of the current mode, written on the status line.
     pub fn mode(&self) -> &'static str {
-        match (&self.input, &self.wizard, &self.help) {
-            (_, Some(_), _) => "LOGIN",
+        match (&self.input, &self.wizard, &self.help, &self.finder) {
+            (_, Some(_), ..) => "LOGIN",
             (Some(_), ..) => "COMMAND",
-            (_, _, Some(_)) => "HELP",
+            (.., Some(_)) => "SEARCH",
+            (_, _, Some(_), _) => "HELP",
             _ => "NORMAL",
         }
     }
@@ -194,6 +206,8 @@ impl App {
         self.notice.clear();
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.quit = true;
+        } else if self.finder.is_some() {
+            self.finder_key(key);
         } else if self.input.is_some() {
             self.input_key(key);
         } else if self.wizard.is_none() {
@@ -223,6 +237,13 @@ impl App {
             'n' => self.next_unread(),
             'N' => self.next_mention(),
             'c' => self.mark_read(),
+            'f' | 'F' => {
+                self.finder = Some(Finder {
+                    all: c == 'F',
+                    line: Line::new(false),
+                    selected: 0,
+                });
+            }
             'w' => self.next_group(),
             'b' => self.previous_group(),
             'J' => self.move_channel(1),
@@ -230,6 +251,53 @@ impl App {
             'H' => self.move_team(-1),
             'L' => self.move_team(1),
             _ => {}
+        }
+    }
+
+    /// The (server, team, channel) of every match of the finder, best first.
+    fn finder_targets(&self) -> Vec<(usize, usize, usize)> {
+        let Some(finder) = &self.finder else {
+            return Vec::new();
+        };
+        let text = finder.line.text();
+        let words: Vec<&str> = text.split_whitespace().collect();
+        let here = (self.server, self.team);
+        let candidates = finder::candidates(&self.servers, here, finder.all);
+        let found = finder::entries(&words, &candidates, finder.all);
+        found
+            .iter()
+            .map(|e| (e.candidate.server, e.candidate.team, e.candidate.chan))
+            .collect()
+    }
+
+    fn finder_key(&mut self, key: KeyEvent) {
+        let targets = self.finder_targets();
+        let count = targets.len();
+        let Some(finder) = &mut self.finder else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => self.finder = None,
+            KeyCode::Enter => {
+                let target = targets.get(finder.selected.min(count.saturating_sub(1)));
+                let target = target.copied();
+                self.finder = None;
+                if let Some((server, team, chan)) = target {
+                    (self.server, self.team) = (server, team);
+                    self.go_channel(chan);
+                }
+            }
+            KeyCode::Up | KeyCode::BackTab if count > 0 => {
+                finder.selected = (finder.selected + count - 1) % count;
+            }
+            KeyCode::Down | KeyCode::Tab if count > 0 => {
+                finder.selected = (finder.selected + 1) % count;
+            }
+            _ => {
+                if finder.line.edit(key) {
+                    finder.selected = 0;
+                }
+            }
         }
     }
 
@@ -1787,5 +1855,95 @@ pub mod tests {
         press(&mut app, "k");
         let asked = older_requests(&sent(&server).await);
         assert!(asked[0].contains("per_page=20"), "{asked:?}");
+    }
+
+    fn add_home(app: &mut App) {
+        let mut server = Server::new("home".into());
+        server.me = Some(json_user("u1", "paul"));
+        app.servers.push(server);
+        let team = serde_json::from_value(serde_json::json!(
+            {"id": "t9", "display_name": "Family"}
+        ))
+        .unwrap();
+        app.loaded(1, Loaded::Teams(vec![team]));
+        let channels = serde_json::from_value(serde_json::json!([
+            {"id": "h1", "type": "O", "display_name": "Garden", "name": "garden"},
+            {"id": "h2", "type": "O", "display_name": "Kitchen", "name": "kitchen"}
+        ]))
+        .unwrap();
+        app.loaded(
+            1,
+            Loaded::Channels {
+                team: TeamId("t9".into()),
+                channels,
+                members: Vec::new(),
+                categories: None,
+            },
+        );
+    }
+
+    #[test]
+    fn f_filters_the_team_and_enter_goes_to_the_channel() {
+        let mut app = fixture();
+        press(&mut app, "f");
+        assert_eq!(app.mode(), "SEARCH");
+        press(&mut app, "town");
+        press_code(&mut app, KeyCode::Enter);
+        assert_eq!(app.mode(), "NORMAL");
+        assert_eq!(app.servers[0].teams[0].cur, 1);
+    }
+
+    #[test]
+    fn esc_closes_the_finder_without_moving_and_keys_are_text_in_it() {
+        let mut app = fixture();
+        press(&mut app, "fjk");
+        assert_eq!(app.finder.as_ref().unwrap().line.text(), "jk");
+        press_code(&mut app, KeyCode::Esc);
+        assert!(app.finder.is_none());
+        assert_eq!(app.servers[0].teams[0].cur, 0);
+    }
+
+    #[test]
+    fn tab_wraps_around_the_matches_and_typing_goes_back_to_the_best() {
+        let mut app = fixture();
+        press(&mut app, "f");
+        for _ in 0..3 {
+            press_code(&mut app, KeyCode::Tab);
+        }
+        assert_eq!(app.finder.as_ref().unwrap().selected, 0);
+        press_code(&mut app, KeyCode::BackTab);
+        assert_eq!(app.finder.as_ref().unwrap().selected, 2);
+        press(&mut app, "t");
+        assert_eq!(app.finder.as_ref().unwrap().selected, 0);
+    }
+
+    #[test]
+    fn capital_f_reaches_other_servers_and_f_does_not() {
+        let mut app = fixture();
+        add_home(&mut app);
+        press(&mut app, "fgard");
+        assert!(app.finder_targets().is_empty());
+        press_code(&mut app, KeyCode::Esc);
+        press(&mut app, "Fgard");
+        assert_eq!(app.finder_targets().len(), 1);
+        press_code(&mut app, KeyCode::Enter);
+        assert_eq!(
+            (app.server, app.team, app.servers[1].teams[0].cur),
+            (1, 0, 0)
+        );
+        press(&mut app, "FKitchen");
+        press_code(&mut app, KeyCode::Enter);
+        assert_eq!(app.servers[1].teams[0].cur, 1);
+    }
+
+    #[test]
+    fn at_lists_the_conversations_and_a_hash_names_the_team() {
+        let mut app = fixture();
+        add_home(&mut app);
+        press(&mut app, "F@");
+        assert_eq!(app.finder_targets(), [(0, 0, 2)]);
+        press_code(&mut app, KeyCode::Esc);
+        press(&mut app, "Fhome#k");
+        assert_eq!(app.finder_targets(), [(1, 0, 1)]);
     }
 }

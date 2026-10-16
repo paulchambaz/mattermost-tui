@@ -308,6 +308,15 @@ pub enum Link {
     Down,
 }
 
+/// The sign written before a channel name.
+pub fn glyph(kind: ChannelKind) -> char {
+    match kind {
+        ChannelKind::Public => '#',
+        ChannelKind::Private => '+',
+        ChannelKind::Direct | ChannelKind::Group => '@',
+    }
+}
+
 /// A logged-in server, or one that is still connecting.
 #[derive(Debug)]
 pub struct Server {
@@ -351,6 +360,11 @@ impl Server {
 
     /// The tab label of a channel: `#` public, `+` private, `@` direct and group.
     pub fn label(&self, chan: &Chan) -> String {
+        format!("{}{}", glyph(chan.info.kind), self.name_of(chan))
+    }
+
+    /// The name of a channel as the tabs write it, without its sign.
+    pub fn name_of(&self, chan: &Chan) -> String {
         let info = &chan.info;
         let name = if info.display_name.is_empty() {
             &info.name
@@ -358,13 +372,11 @@ impl Server {
             &info.display_name
         };
         match info.kind {
-            ChannelKind::Public => format!("#{name}"),
-            ChannelKind::Private => format!("+{name}"),
-            ChannelKind::Group => format!("@{name}"),
             ChannelKind::Direct => match self.other_of(info) {
-                Some(other) => format!("@{}", self.username(&other)),
-                None => "@…".into(),
+                Some(other) => self.username(&other).to_owned(),
+                None => "…".into(),
             },
+            _ => name.clone(),
         }
     }
 
