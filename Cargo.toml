@@ -14,13 +14,17 @@ categories = ["command-line-utilities"]
 
 [dependencies]
 anyhow = "1.0.104"
+chrono = "0.4.45"
 directories = "6.0.0"
+emojis = "0.9.0"
+ratatui = "0.30.2"
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "query", "rustls"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 thiserror = "2.0.21"
-tokio = { version = "1.53.3", features = ["rt", "macros"] }
+tokio = { version = "1.53.3", features = ["rt", "macros", "sync"] }
 toml = "1.1.8"
+unicode-width = "0.2.2"
 
 [[bin]]
 name = "mm"

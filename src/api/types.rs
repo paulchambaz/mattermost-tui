@@ -22,21 +22,12 @@ id!(PostId, "Identifier of a post.");
 pub struct User {
     pub id: UserId,
     pub username: String,
-    #[serde(default)]
-    pub nickname: String,
-    #[serde(default)]
-    pub first_name: String,
-    #[serde(default)]
-    pub last_name: String,
-    #[serde(default)]
-    pub locale: String,
 }
 
 /// A team the reader belongs to.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Team {
     pub id: TeamId,
-    pub name: String,
     pub display_name: String,
 }
 
@@ -61,21 +52,13 @@ pub enum ChannelKind {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Channel {
     pub id: ChannelId,
-    #[serde(default)]
-    pub team_id: String,
     #[serde(rename = "type")]
     pub kind: ChannelKind,
     #[serde(default)]
     pub display_name: String,
     pub name: String,
     #[serde(default)]
-    pub header: String,
-    #[serde(default)]
-    pub purpose: String,
-    #[serde(default)]
     pub last_post_at: i64,
-    #[serde(default)]
-    pub total_msg_count: i64,
     #[serde(default)]
     pub delete_at: i64,
 }
@@ -94,34 +77,20 @@ pub struct ChannelMember {
     #[serde(default)]
     pub last_viewed_at: i64,
     #[serde(default)]
-    pub msg_count: i64,
-    #[serde(default)]
     pub mention_count: i64,
     #[serde(default)]
     pub notify_props: NotifyProps,
 }
 
-/// One user's reaction to a post.
-#[derive(Debug, Clone, Deserialize)]
-pub struct Reaction {
-    pub user_id: UserId,
-    pub emoji_name: String,
-}
-
 /// A file attached to a post.
 #[derive(Debug, Clone, Deserialize)]
 pub struct FileInfo {
-    pub id: String,
     pub name: String,
-    #[serde(default)]
-    pub size: i64,
 }
 
 /// Extra data the server sends along with a post.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Metadata {
-    #[serde(default)]
-    pub reactions: Option<Vec<Reaction>>,
     #[serde(default)]
     pub files: Option<Vec<FileInfo>>,
 }
@@ -136,7 +105,6 @@ pub struct Post {
     #[serde(default)]
     pub delete_at: i64,
     pub user_id: UserId,
-    pub channel_id: ChannelId,
     #[serde(default)]
     pub root_id: String,
     #[serde(default)]
@@ -145,6 +113,37 @@ pub struct Post {
     pub kind: String,
     #[serde(default)]
     pub metadata: Metadata,
+}
+
+/// One sidebar category and the channels it holds.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Category {
+    pub id: String,
+    #[serde(default)]
+    pub channel_ids: Vec<ChannelId>,
+}
+
+/// The sidebar categories of a team, with the order they are shown in.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CategoryList {
+    #[serde(default)]
+    pub order: Vec<String>,
+    pub categories: Vec<Category>,
+}
+
+impl CategoryList {
+    /// Channel ids in sidebar order: categories as ordered, channels as listed.
+    pub fn channel_ids(&self) -> impl Iterator<Item = &ChannelId> {
+        let ordered = self
+            .order
+            .iter()
+            .filter_map(|id| self.categories.iter().find(|c| &c.id == id));
+        let unordered = self
+            .categories
+            .iter()
+            .filter(|c| !self.order.contains(&c.id));
+        ordered.chain(unordered).flat_map(|c| c.channel_ids.iter())
+    }
 }
 
 /// A page of posts; `order` lists their ids newest first.
@@ -173,9 +172,9 @@ mod tests {
         assert_eq!(posts[0].id, PostId("p2".into()));
         assert_eq!(posts[0].root_id, "p1");
         assert!(posts[0].edit_at > 0);
-        let reactions = posts[0].metadata.reactions.as_deref().unwrap_or_default();
-        assert_eq!(reactions[0].emoji_name, "+1");
-        assert!(posts[1].metadata.reactions.is_none());
+        let files = posts[0].metadata.files.as_deref().unwrap_or_default();
+        assert_eq!(files[0].name, "a.png");
+        assert!(posts[1].metadata.files.is_none());
     }
 
     #[test]
@@ -193,6 +192,14 @@ mod tests {
             ]
         );
         assert_eq!(channels[1].name, "u1__u2");
+    }
+
+    #[test]
+    fn categories_give_the_sidebar_order() {
+        let list: CategoryList =
+            serde_json::from_str(include_str!("../../tests/fixtures/categories.json")).unwrap();
+        let ids: Vec<_> = list.channel_ids().map(|c| c.0.as_str()).collect();
+        assert_eq!(ids, ["c3", "c1", "c2"]);
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! Read-only Mattermost REST client with automatic re-login.
 
+/// Wire types of the REST API.
 pub mod types;
 
 use std::sync::{Mutex, PoisonError};
@@ -10,7 +11,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::config::Credentials;
-use types::{Channel, ChannelId, ChannelMember, PostId, PostList, Team, TeamId, User, UserId};
+use types::{
+    CategoryList, Channel, ChannelId, ChannelMember, PostId, PostList, Team, TeamId, User, UserId,
+};
 
 /// Everything that can go wrong talking to a server.
 #[derive(Debug, Error)]
@@ -118,6 +121,15 @@ impl Client {
     /// Fails on network or server errors.
     pub async fn members(&self, team: &TeamId) -> Result<Vec<ChannelMember>, Error> {
         let path = format!("/users/me/teams/{}/channels/members", team.0);
+        self.fetch(Method::GET, &path, &[], None::<&()>).await
+    }
+
+    /// The sidebar categories of a team, which say which channels are shown.
+    ///
+    /// # Errors
+    /// Fails on network or server errors, and on servers older than 5.26.
+    pub async fn categories(&self, team: &TeamId) -> Result<CategoryList, Error> {
+        let path = format!("/users/me/teams/{}/channels/categories", team.0);
         self.fetch(Method::GET, &path, &[], None::<&()>).await
     }
 
