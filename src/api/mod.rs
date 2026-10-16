@@ -1,7 +1,7 @@
 //! Mattermost REST client with automatic re-login.
 //!
 //! Everything it does is a read except `view`, `create_post`, `edit_post`, `delete_post`,
-//! `react` and `unreact`.
+//! `react`, `unreact`, `create_direct`, `join`, `leave`, `set_status`, `pin` and `unpin`.
 
 /// Wire types of the REST API.
 pub mod types;
@@ -15,8 +15,8 @@ use thiserror::Error;
 
 use crate::config::Credentials;
 use types::{
-    CategoryList, Channel, ChannelId, ChannelMember, Post, PostId, PostList, Reaction, Team,
-    TeamId, User, UserId, UserStatus,
+    CategoryList, Channel, ChannelId, ChannelMember, Post, PostId, PostList, Reaction, Status,
+    Team, TeamId, User, UserId, UserStatus,
 };
 
 /// Everything that can go wrong talking to a server.
@@ -238,6 +238,88 @@ impl Client {
         let path = format!("/users/{}/posts/{}/reactions/{emoji}", user.0, post.0);
         let _: serde_json::Value = self.fetch(Method::DELETE, &path, &[], None::<&()>).await?;
         Ok(())
+    }
+
+    /// Opens the direct conversation between two users, which posts nothing.
+    ///
+    /// # Errors
+    /// Fails on network or server errors.
+    pub async fn create_direct(&self, me: &UserId, other: &UserId) -> Result<Channel, Error> {
+        let ids = [&me.0, &other.0];
+        self.fetch(Method::POST, "/channels/direct", &[], Some(&ids))
+            .await
+    }
+
+    /// Makes the reader a member of a channel.
+    ///
+    /// # Errors
+    /// Fails on network or server errors, and when the channel cannot be joined.
+    pub async fn join(&self, channel: &ChannelId, user: &UserId) -> Result<(), Error> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            user_id: &'a str,
+        }
+        let path = format!("/channels/{}/members", channel.0);
+        let body = Body { user_id: &user.0 };
+        let _: serde_json::Value = self.fetch(Method::POST, &path, &[], Some(&body)).await?;
+        Ok(())
+    }
+
+    /// Takes the reader out of a channel.
+    ///
+    /// # Errors
+    /// Fails on network or server errors, and when the channel cannot be left.
+    pub async fn leave(&self, channel: &ChannelId, user: &UserId) -> Result<(), Error> {
+        let path = format!("/channels/{}/members/{}", channel.0, user.0);
+        let _: serde_json::Value = self.fetch(Method::DELETE, &path, &[], None::<&()>).await?;
+        Ok(())
+    }
+
+    /// Sets the presence of the reader.
+    ///
+    /// # Errors
+    /// Fails on network or server errors.
+    pub async fn set_status(&self, user: &UserId, status: Status) -> Result<(), Error> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            user_id: &'a str,
+            status: &'a str,
+        }
+        let path = format!("/users/{}/status", user.0);
+        let body = Body {
+            user_id: &user.0,
+            status: status.word(),
+        };
+        let _: serde_json::Value = self.fetch(Method::PUT, &path, &[], Some(&body)).await?;
+        Ok(())
+    }
+
+    /// Pins a post to its channel, or unpins it.
+    ///
+    /// # Errors
+    /// Fails on network or server errors.
+    pub async fn pin(&self, post: &PostId, pinned: bool) -> Result<(), Error> {
+        let path = format!("/posts/{}/{}", post.0, if pinned { "pin" } else { "unpin" });
+        let _: serde_json::Value = self.fetch(Method::POST, &path, &[], None::<&()>).await?;
+        Ok(())
+    }
+
+    /// The account with this username.
+    ///
+    /// # Errors
+    /// Fails on network or server errors, and when nobody has that name.
+    pub async fn user_named(&self, name: &str) -> Result<User, Error> {
+        let path = format!("/users/username/{name}");
+        self.fetch(Method::GET, &path, &[], None::<&()>).await
+    }
+
+    /// A channel of a team by its name in the address.
+    ///
+    /// # Errors
+    /// Fails on network or server errors, and when the team has no such channel.
+    pub async fn channel_named(&self, team: &TeamId, name: &str) -> Result<Channel, Error> {
+        let path = format!("/teams/{}/channels/name/{name}", team.0);
+        self.fetch(Method::GET, &path, &[], None::<&()>).await
     }
 
     /// The first 200 members of a channel.

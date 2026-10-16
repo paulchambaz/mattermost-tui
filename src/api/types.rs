@@ -35,6 +35,16 @@ pub enum Status {
 }
 
 impl Status {
+    /// The server's word for a status.
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Online => "online",
+            Self::Away => "away",
+            Self::DoNotDisturb => "dnd",
+            Self::Offline => "offline",
+        }
+    }
+
     /// Reads the server's word for a status; anything unknown counts as offline.
     pub fn parse(word: &str) -> Self {
         match word {
@@ -92,6 +102,10 @@ pub struct Channel {
     pub total_msg_count: i64,
     #[serde(default)]
     pub delete_at: i64,
+    #[serde(default)]
+    pub header: String,
+    #[serde(default)]
+    pub purpose: String,
 }
 
 /// Notification settings of one membership.

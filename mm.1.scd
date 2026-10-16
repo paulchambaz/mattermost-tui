@@ -13,8 +13,6 @@ MM(1) "github.com/paulchambaz/mattermost-tui" "General Commands Manual"
 *mm* is a terminal client for Mattermost. It keeps several servers and teams
 open at once, shows new messages as they arrive, tells you what is unread and
 where you were mentioned, and lets you write messages in your own editor.
-Administration, calls, plugins, dialogs and inline images are left to the web
-app.
 
 The screen has four parts. The channels of the current team are tabs along the
 top: the current one is inverted, unread ones are bold with a dot, and a
@@ -153,15 +151,87 @@ _a#b_
 
 # COMMANDS
 
-A command is typed after *:* and run with *enter*.
+A command is typed after *:* and run with *enter*. As in vi, a command can be
+shortened to the fewest letters that tell it from the others: *:ser* is *server*,
+*:rel* is *reload*, *:q* is *quit*. When the letters fit several commands, they
+are listed instead. The status line shows the commands that begin with what you
+typed, and *tab* writes the first one in full, then the next ones, *shift-tab*
+going back. Names of servers, teams and
+users are matched without regard to case: a whole name wins, otherwise a part of
+a name works when only one name has it.
+
+*server*, *team*, *remove-server* and *dm* show the names that fit what you type on
+the status line, like the finder does. *tab* and the arrow keys choose and
+*enter* takes the chosen name, the first one if you did not choose. For *dm*
+the names are the users *mm* already knows, such as the authors of messages
+you have seen and the people you have talked to.
 
 *new-server*
 	Log in to another server.
 
+*server* _name_
+	Go to a server.
+
+*team* _name_
+	Go to a team of the current server.
+
+*go* _words_
+	Open the best channel matching the words, in the current team, as *f* does.
+	See *FINDER*.
+
+*remove-server* _name_
+	Forget a server: it is taken out of _servers.toml_ and closed. Nothing is
+	changed on the server itself.
+
+*dm* _user_
+	Open the direct conversation with a user, creating it if needed.
+
+*join* _channel_
+	Join a public channel of the current team, given by the name it has in its
+	address, such as _town-square_.
+
+*leave*
+	Leave the open channel. Direct and group conversations cannot be left.
+
+*topic*
+	Show the header and the purpose of the open channel.
+
+*reload*
+	Fetch the open channel, its messages and the channel list again, for
+	example after the connection dropped.
+
+*mark-read*
+	Mark the open channel as read, like *c*.
+
+*mark-all-read*
+	Mark every unread channel of the current team as read.
+
+*users*, *reactions*, *open*
+	The same as *m*, *a* and *o*.
+
+*copy* [*full*]
+	The same as *y*, or as *Y* with *full*.
+
+*react* _name_
+	React to the selected message with any emoji known by name, such as
+	_tada_. Like *x*, reacting again with the same emoji removes it.
+
+*pin*, *unpin*
+	Pin the selected message to its channel, or unpin it.
+
+*status* _online|away|dnd|offline_
+	Set your presence.
+
+*set* _key_ _value_
+	Change a setting until you quit: *editor*, *copy*, *open.image*,
+	*open.video*, *open.browser*, *open.text* or *open.other*. Without a value,
+	*editor* and *copy* go back to their automatic choice. Nothing is written to
+	_config.toml_.
+
 *help*
 	Show the help.
 
-*quit*, *q*
+*quit*
 	Quit.
 
 # WRITING

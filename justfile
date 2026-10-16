@@ -8,7 +8,7 @@ build:
   cargo build --release
 
 test:
-  cargo test
+  cargo test --all-targets
 
 watch-test:
   cargo watch -x test
@@ -28,3 +28,11 @@ man:
 install prefix=(env_var('HOME') + '/.local'): build man
   install -Dm755 target/release/mm {{ prefix }}/bin/mm
   install -Dm644 mm.1 {{ prefix }}/share/man/man1/mm.1
+
+demo:
+  cargo build --release --bin mm --example demo
+  target/release/examples/demo
+
+vhs:
+  cargo build --release --bin mm --example demo
+  vhs demo.tape

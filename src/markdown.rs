@@ -50,6 +50,9 @@ impl Text {
     }
 }
 
+/// Marks the colored form of an emoji such as the red heart, which terminals draw one or two cells wide.
+pub const COLORED: char = '\u{fe0f}';
+
 /// Replaces `:shortcode:` with the emoji it names; unknown names stay as they are.
 pub fn emoji(text: &str) -> String {
     let mut out = String::with_capacity(text.len());

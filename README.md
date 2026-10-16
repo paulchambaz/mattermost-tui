@@ -1,8 +1,8 @@
 # mattermost-tui
 
-mattermost-tui (`mm`) is a keyboard-driven terminal client for Mattermost. It keeps several servers and teams open at once, shows new messages as they arrive, tells you what is unread and where you were mentioned, finds a channel as you type its name, and lets you write your messages in your own editor. Links and attachments open in the programs you choose.
+mattermost-tui (`mm`) is a keyboard-driven terminal client for Mattermost. Several servers and teams side by side, live messages, unread and mentions, a channel finder, your own editor for writing, and your own programs for opening links and attachments.
 
-That being said, the real ground truth is your Mattermost server. `mm` is for reading and writing messages: administration, calls, plugins, dialogs and inline images are left to the web app.
+![](./demo.gif)
 
 ## Installation
 
@@ -48,7 +48,7 @@ The channels of the current team are tabs along the top, the conversation is bel
 | `?` | the full list of keys |
 | `q` | quit |
 
-Everything is detailed in the [`man`](./mm.1.scd) page (`man mm` once installed).
+Press `:` for commands such as `:server`, `:go`, `:dm` or `:status`. Everything is detailed in the [`man`](./mm.1.scd) page (`man mm` once installed).
 
 Your servers are kept in `~/.config/mm/servers.toml`, readable only by you, password included so the session can be renewed. If you would rather not keep a password in a file, `servers.toml` can instead name a command that prints it, such as `password_cmd = "pass show work/chat"`. See the man page.
 
@@ -95,6 +95,7 @@ just build
 just test
 just lint
 just install # binary and man page in ~/.local
+just demo # try mm on made-up data, no server needed
 ```
 
 ## Contribution

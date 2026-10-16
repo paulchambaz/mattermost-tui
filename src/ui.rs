@@ -12,6 +12,7 @@ use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::api::types::Status;
+use crate::app::commands::Completion;
 use crate::app::{App, Item, Kind, REACTIONS};
 use crate::finder;
 use crate::markdown;
@@ -80,6 +81,26 @@ const FINDER: &[(&str, &str)] = &[
 
 const COMMANDS: &[(&str, &str)] = &[
     ("new-server", "log in to another server"),
+    ("remove-server n", "forget a server"),
+    ("server n", "go to a server by name"),
+    ("team n", "go to a team of this server by name"),
+    ("go words", "open a channel, as f does"),
+    ("dm user", "open a direct conversation"),
+    ("join channel", "join a public channel by its address name"),
+    ("leave", "leave the open channel"),
+    ("topic", "show the header and purpose of the channel"),
+    ("reload", "fetch the channel and its messages again"),
+    ("mark-read", "mark the open channel as read (c)"),
+    ("mark-all-read", "mark every channel of the team as read"),
+    ("users", "users column (m)"),
+    ("reactions", "reactions under the messages (a)"),
+    ("react name", "react with any emoji by name (x)"),
+    ("pin", "pin the selected message"),
+    ("unpin", "unpin the selected message"),
+    ("open", "open links and attachments (o)"),
+    ("copy [full]", "copy the message (y), full: with author (Y)"),
+    ("status s", "online, away, dnd or offline"),
+    ("set key value", "change a setting until you quit"),
     ("help", "this help"),
     ("quit", "quit"),
 ];
@@ -563,7 +584,9 @@ fn picker_line(width: usize) -> Line<'static> {
             (i + 1).to_string(),
             line.add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
         ));
-        spans.push(Span::styled(format!(" {glyph} "), line));
+        spans.push(Span::styled(" ", line));
+        spans.push(Span::styled(glyph, line));
+        spans.push(Span::styled(" ", line));
     }
     let used: usize = spans.iter().map(Span::width).sum();
     spans.push(Span::styled(" ".repeat(width.saturating_sub(used)), line));
@@ -719,6 +742,66 @@ fn wildmenu(app: &App, width: usize) -> Line<'static> {
             spans
         })
         .collect();
+    menu_line(mode, chip, scope, items, selected, width)
+}
+
+/// The names the command line offers, on the status line like the finder's matches.
+fn completion_line(choice: usize, completion: &Completion, width: usize) -> Line<'static> {
+    let line = Style::new().add_modifier(Modifier::REVERSED);
+    let mode = Span::styled(" COMMAND ", line);
+    if completion.names.is_empty() {
+        let rest = width.saturating_sub(mode.width());
+        return Line::from(vec![
+            mode,
+            Span::styled(pad_right(" no result", rest), line),
+        ]);
+    }
+    let selected = choice.min(completion.names.len() - 1);
+    let chip = Span::styled(
+        format!(" {}/{} ", selected + 1, completion.names.len()),
+        line,
+    );
+    let label = if completion.command.is_empty() {
+        "command"
+    } else {
+        completion.command
+    };
+    let scope = Span::styled(format!(" {label} "), line);
+    let at = if completion.command == "dm" { "@" } else { "" };
+    let items = completion
+        .names
+        .iter()
+        .enumerate()
+        .map(|(i, (name, hits))| {
+            let mut base = line;
+            let mut hl = base.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+            if i == selected {
+                base = Style::new()
+                    .bg(Color::Indexed(3))
+                    .fg(Color::Indexed(0))
+                    .add_modifier(Modifier::BOLD);
+                hl = base.add_modifier(Modifier::UNDERLINED);
+            }
+            let mut spans = vec![Span::styled(format!(" {at}"), base)];
+            spans.extend(highlighted(name, hits, base, hl));
+            spans.push(Span::styled(" ", base));
+            spans
+        })
+        .collect();
+    menu_line(mode, chip, scope, items, selected, width)
+}
+
+/// The mode, the count, the items side by side scrolled to show the chosen one, and the scope.
+fn menu_line(
+    mode: Span<'static>,
+    chip: Span<'static>,
+    scope: Span<'static>,
+    items: Vec<Vec<Span<'static>>>,
+    selected: usize,
+    width: usize,
+) -> Line<'static> {
+    let line = Style::new().add_modifier(Modifier::REVERSED);
+    let total = items.len();
     let widths: Vec<usize> = items
         .iter()
         .map(|spans| spans.iter().map(Span::width).sum())
@@ -740,7 +823,7 @@ fn wildmenu(app: &App, width: usize) -> Line<'static> {
     }
 
     let left = Span::styled(if first > 0 { "‹" } else { " " }, line);
-    let right = Span::styled(if last + 1 < found.len() { "›" } else { " " }, line);
+    let right = Span::styled(if last + 1 < total { "›" } else { " " }, line);
     let gap = width.saturating_sub(mode.width() + chip.width() + 2 + used + scope.width());
     let mut spans = vec![mode, chip, left];
     spans.extend(menu);
@@ -961,11 +1044,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             input.y,
         ));
     }
-    let bottom = match (&app.finder, app.picker, &app.opener) {
+    let bottom = match (&app.finder, app.picker, &app.opener, app.completion()) {
         (Some(_), ..) => wildmenu(app, width),
-        (None, true, _) => picker_line(width),
-        (None, false, Some(items)) => open_line(items, width),
-        (None, false, None) => status_line(app, width, percent),
+        (None, true, ..) => picker_line(width),
+        (None, false, Some(items), _) => open_line(items, width),
+        (None, false, None, Some(completion)) => completion_line(app.choice, &completion, width),
+        (None, false, None, None) => status_line(app, width, percent),
     };
     frame.render_widget(Paragraph::new(bottom), status);
     if app.plain {
@@ -1101,6 +1185,37 @@ pub mod tests {
     }
 
     #[test]
+    fn the_man_page_describes_every_command_of_the_help() {
+        let page = include_str!("../mm.1.scd");
+        for (command, _) in COMMANDS {
+            let name = command.split_whitespace().next().unwrap();
+            assert!(page.contains(&format!("*{name}*")), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_help_lists_the_commands_the_command_line_knows() {
+        let helped: Vec<&str> = COMMANDS
+            .iter()
+            .map(|(c, _)| c.split_whitespace().next().unwrap())
+            .collect();
+        let known: Vec<&str> = crate::input::COMMANDS.iter().map(|(n, _)| *n).collect();
+        assert_eq!(helped, known);
+    }
+
+    #[test]
+    fn typing_a_command_start_lists_the_commands_that_begin_so() {
+        let mut app = fixture();
+        press(&mut app, ":mark");
+        let lines = screen(&mut app, 60, 12);
+        assert_eq!(from_end(&lines, 2), " :mark");
+        let menu = from_end(&lines, 1);
+        assert!(menu.starts_with(" COMMAND  1/2 "), "{menu:?}");
+        assert!(menu.contains("mark-read") && menu.contains("mark-all-read"));
+        assert!(menu.ends_with(" command"));
+    }
+
+    #[test]
     fn truncate_counts_cells() {
         assert_eq!(truncate("abcdef", 4), "abc…");
         assert_eq!(truncate("日本語です", 5), "日本…");
@@ -1207,7 +1322,9 @@ pub mod tests {
         assert!(from_end(&lines, 1).starts_with(" HELP"));
         press(&mut app, &"j".repeat(80));
         let lines = screen(&mut app, 60, 12);
-        assert!(lines.iter().any(|l| l.contains("log in to another server")));
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("change a setting until you quit")));
         press(&mut app, "?");
         assert!(from_end(&screen(&mut app, 60, 12), 1).starts_with(" NORMAL"));
     }
@@ -1252,6 +1369,33 @@ pub mod tests {
         assert!(menu.contains("+Secret") && menu.contains("#Town Square") && menu.contains("@ana"));
         assert!(menu.ends_with("this team"));
         assert!(has_background(&mut app, 11));
+    }
+
+    #[test]
+    fn the_command_line_offers_names_on_the_last_row_like_the_finder() {
+        let mut app = fixture();
+        app.servers[0].teams.push(crate::model::Team {
+            info: serde_json::from_value(
+                serde_json::json!({"id": "t2", "name": "d", "display_name": "Design"}),
+            )
+            .unwrap(),
+            chans: None,
+            loading: false,
+            cur: 0,
+        });
+        press(&mut app, ":team ");
+        let lines = screen(&mut app, 60, 12);
+        assert_eq!(from_end(&lines, 2), " :team");
+        let menu = from_end(&lines, 1);
+        assert!(menu.starts_with(" COMMAND  1/2 "), "{menu:?}");
+        assert!(menu.contains("Engineering") && menu.contains("Design"));
+        assert!(menu.ends_with(" team"));
+        assert!(has_background(&mut app, 11));
+        press(&mut app, "zzz");
+        assert_eq!(
+            from_end(&screen(&mut app, 60, 12), 1),
+            " COMMAND  no result"
+        );
     }
 
     #[test]

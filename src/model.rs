@@ -367,6 +367,7 @@ pub struct Server {
     pub members_loading: HashSet<ChannelId>,
     pub status: HashMap<UserId, Status>,
     pub actions: Option<tokio::sync::mpsc::UnboundedSender<Action>>,
+    pub ws: Option<tokio::task::JoinHandle<()>>,
     pub link: Link,
 }
 
@@ -390,8 +391,14 @@ impl Server {
             members_loading: HashSet::new(),
             status: HashMap::new(),
             actions: None,
+            ws: None,
             link: Link::Connecting,
         }
+    }
+
+    /// Whether the server was removed, which leaves an empty slot so that indexes stay valid.
+    pub fn is_gone(&self) -> bool {
+        self.name.is_empty()
     }
 
     /// The name of a user, or `?` while it is being fetched.
@@ -538,6 +545,8 @@ mod tests {
             last_post_at: last,
             total_msg_count: last,
             delete_at: 0,
+            header: String::new(),
+            purpose: String::new(),
         }
     }
 

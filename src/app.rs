@@ -1,5 +1,7 @@
 //! Application state, the events that change it, and the requests it starts.
 
+pub mod commands;
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
@@ -18,7 +20,7 @@ use crate::clipboard;
 use crate::config::{self, Credentials, ServerConfig, Settings};
 use crate::debug;
 use crate::finder;
-use crate::input::{self, Command, Line, Step, Wizard};
+use crate::input::{self, Line, Step, Wizard};
 use crate::model::{
     self, group_start, group_with_previous, Attachment, Link, Message, Server, Team,
 };
@@ -76,6 +78,10 @@ pub enum Loaded {
     },
     Reacted(Reaction),
     Unreacted(Reaction),
+    Opened(ChannelId),
+    Left(String),
+    StatusSet(Status),
+    Said(String),
     Created(Post),
     Edited(Post),
     Deleted {
@@ -206,11 +212,15 @@ pub struct App {
     pub wizard: Option<Wizard>,
     pub help: Option<usize>,
     pub finder: Option<Finder>,
+    /// The name chosen among those the command line offers.
+    pub choice: usize,
+    cycle: Option<String>,
     pub picker: bool,
     pub selecting: bool,
     anchor: usize,
     register: String,
-    last_reaction: Option<&'static str>,
+    last_reaction: Option<String>,
+    go: Option<ChannelId>,
     pub clipboard: Vec<String>,
     pub users: Users,
     pub compose: Option<Compose>,
@@ -254,11 +264,14 @@ impl App {
             wizard: None,
             help: None,
             finder: None,
+            choice: 0,
+            cycle: None,
             picker: false,
             selecting: false,
             anchor: 0,
             register: String::new(),
             last_reaction: None,
+            go: None,
             clipboard: Vec::new(),
             users: Users::default(),
             compose: None,
@@ -951,13 +964,13 @@ impl App {
     }
 
     fn repeat_reaction(&mut self) {
-        match self.last_reaction {
-            Some(name) => self.react(name),
+        match self.last_reaction.clone() {
+            Some(name) => self.react(&name),
             None => self.notice = "No recent reaction: pick one with x".into(),
         }
     }
 
-    fn react(&mut self, name: &'static str) {
+    fn react(&mut self, name: &str) {
         let Some(target) = self.target() else {
             return;
         };
@@ -972,19 +985,20 @@ impl App {
             return;
         };
         self.browsing = true;
-        self.last_reaction = Some(name);
+        let name = name.to_owned();
+        self.last_reaction = Some(name.clone());
         let post = target.id;
-        let had = target.mine.iter().any(|n| n == name);
+        let had = target.mine.contains(&name);
         self.spawn(self.server, async move {
             let done = match had {
-                true => client.unreact(&me, &post, name).await.map(|()| {
+                true => client.unreact(&me, &post, &name).await.map(|()| {
                     Loaded::Unreacted(Reaction {
                         user_id: me.clone(),
                         post_id: post.clone(),
-                        emoji_name: name.into(),
+                        emoji_name: name.clone(),
                     })
                 }),
-                false => client.react(&me, &post, name).await.map(Loaded::Reacted),
+                false => client.react(&me, &post, &name).await.map(Loaded::Reacted),
             };
             done.unwrap_or_else(|e| Loaded::Failed(e.to_string()))
         });
@@ -1131,15 +1145,24 @@ impl App {
             KeyCode::Esc => {
                 self.input = None;
                 self.wizard = None;
+                self.choice = 0;
+                self.cycle = None;
             }
             KeyCode::Enter => {
-                if let Some(line) = self.input.take() {
-                    self.submit(&line.text());
+                if let Some(line) = &self.input {
+                    let text = self.completed(&line.text());
+                    self.input = None;
+                    (self.choice, self.cycle) = (0, None);
+                    self.submit(&text);
                 }
             }
+            KeyCode::Tab | KeyCode::Down => self.tab(false),
+            KeyCode::BackTab | KeyCode::Up => self.tab(true),
             _ => {
                 if let Some(line) = &mut self.input {
-                    line.edit(key);
+                    if line.edit(key) {
+                        (self.choice, self.cycle) = (0, None);
+                    }
                 }
             }
         }
@@ -1151,10 +1174,15 @@ impl App {
         }
         match (input::parse(text), text.trim()) {
             (_, "") => {}
-            (Some(Command::NewServer), _) => self.new_server(),
-            (Some(Command::Help), _) => self.help = Some(0),
-            (Some(Command::Quit), _) => self.quit = true,
-            (None, other) => self.notice = format!("Unknown command: {other}"),
+            (Some(command), _) => self.run_command(command),
+            (None, other) => {
+                let word = other.split_whitespace().next().unwrap_or(other);
+                let hits = input::matching(word);
+                self.notice = match hits.len() > 1 {
+                    true => format!("Ambiguous: {}", hits.join(", ")),
+                    false => format!("Unknown command: {other}"),
+                };
+            }
         }
     }
 
@@ -1423,7 +1451,7 @@ impl App {
             other => other,
         };
         let current = self.current_id(i);
-        let Some(server) = self.servers.get_mut(i) else {
+        let Some(server) = self.servers.get_mut(i).filter(|s| !s.is_gone()) else {
             return;
         };
         match loaded {
@@ -1459,6 +1487,26 @@ impl App {
                     self.fetch_channels(i, id);
                 }
             }
+            Loaded::Opened(id) => {
+                let team = server.teams.get(self.team).map(|t| t.info.id.clone());
+                if let (Some(team), true) = (team, i == self.server) {
+                    self.go = Some(id);
+                    self.fetch_channels(i, team);
+                }
+            }
+            Loaded::Left(name) => {
+                self.notice = format!("Left {name}");
+                if let Some(team) = server.teams.get(self.team).map(|t| t.info.id.clone()) {
+                    self.fetch_channels(i, team);
+                }
+            }
+            Loaded::StatusSet(status) => {
+                if let Some(me) = server.me.as_ref().map(|m| m.id.clone()) {
+                    server.status.insert(me, status);
+                }
+                self.notice = format!("Status: {}", status.word());
+            }
+            Loaded::Said(text) => self.notice = text,
             Loaded::Channels {
                 team,
                 channels,
@@ -1485,16 +1533,24 @@ impl App {
                     .filter_map(|c| server.other_of(&c.info))
                     .collect();
                 let ids = server.unknown(others.iter());
+                let wanted = self.go.take();
                 if let Some(t) = server.teams.iter_mut().find(|t| t.info.id == team) {
                     let kept = t.chans.as_ref().and_then(|c| c.get(t.cur));
                     let kept = kept.map(|c| c.info.id.clone());
-                    t.cur = kept
-                        .and_then(|id| chans.iter().position(|c| c.info.id == id))
-                        .unwrap_or(0);
+                    let find = |id: ChannelId| chans.iter().position(|c| c.info.id == id);
+                    let target = wanted.clone().and_then(find);
+                    if wanted.is_some() && target.is_none() {
+                        self.notice = "That channel is not in your sidebar".into();
+                    }
+                    t.cur = target.or_else(|| kept.and_then(find)).unwrap_or(0);
                     t.chans = Some(chans);
                     t.loading = false;
                 }
                 self.fetch_users(i, ids);
+                if self.current_id(i) != current {
+                    self.reset_view();
+                    self.ensure();
+                }
             }
             Loaded::Posts { channel, list } => {
                 let messages = model::messages_of(&list);
@@ -1602,7 +1658,7 @@ impl App {
     }
 
     fn ws(&mut self, i: usize, ws: Ws) {
-        let Some(server) = self.servers.get_mut(i) else {
+        let Some(server) = self.servers.get_mut(i).filter(|s| !s.is_gone()) else {
             return;
         };
         match ws {
@@ -2041,9 +2097,12 @@ impl App {
         };
         let (actions, receiver) = unbounded_channel();
         server.actions = Some(actions);
-        tokio::spawn(ws::run(client, ws::BACKOFF, receiver, move |event| {
-            tx.send(Msg::Ws(i, event)).is_ok()
-        }));
+        server.ws = Some(tokio::spawn(ws::run(
+            client,
+            ws::BACKOFF,
+            receiver,
+            move |event| tx.send(Msg::Ws(i, event)).is_ok(),
+        )));
     }
 
     fn connect(&self, i: usize, url: &str, credentials: Credentials) {
@@ -2138,7 +2197,7 @@ pub mod tests {
         app
     }
 
-    fn fixture_rx() -> (App, tokio::sync::mpsc::UnboundedReceiver<Msg>) {
+    pub fn fixture_rx() -> (App, tokio::sync::mpsc::UnboundedReceiver<Msg>) {
         let (tx, rx) = unbounded_channel();
         let config = ServerConfig {
             name: "work".into(),
@@ -2195,12 +2254,12 @@ pub mod tests {
         (app, rx)
     }
 
-    fn json<T: DeserializeOwned>(name: &str) -> T {
+    pub fn json<T: DeserializeOwned>(name: &str) -> T {
         let text = std::fs::read_to_string(format!("tests/fixtures/{name}.json")).unwrap();
         serde_json::from_str(&text).unwrap()
     }
 
-    fn json_user(id: &str, name: &str) -> User {
+    pub fn json_user(id: &str, name: &str) -> User {
         serde_json::from_value(serde_json::json!({"id": id, "username": name})).unwrap()
     }
 
@@ -2534,7 +2593,7 @@ pub mod tests {
         assert!(!tabs(&mut app).contains("•#Town Square"));
     }
 
-    async fn live() -> (App, wiremock::MockServer) {
+    pub async fn live() -> (App, wiremock::MockServer) {
         use wiremock::matchers::any;
         use wiremock::{Mock, MockServer, ResponseTemplate};
         let server = MockServer::start().await;
@@ -2552,7 +2611,7 @@ pub mod tests {
         (app, server)
     }
 
-    async fn sent(server: &wiremock::MockServer) -> Vec<(String, String, String)> {
+    pub async fn sent(server: &wiremock::MockServer) -> Vec<(String, String, String)> {
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         let requests = server.received_requests().await.unwrap();
         requests
@@ -2568,7 +2627,7 @@ pub mod tests {
             .collect()
     }
 
-    fn views(requests: &[(String, String, String)]) -> Vec<serde_json::Value> {
+    pub fn views(requests: &[(String, String, String)]) -> Vec<serde_json::Value> {
         requests
             .iter()
             .filter(|(_, path, _)| path == "/api/v4/channels/members/me/view")
@@ -3011,7 +3070,7 @@ pub mod tests {
         (app, rx, server)
     }
 
-    async fn settle(
+    pub async fn settle(
         app: &mut App,
         rx: &mut tokio::sync::mpsc::UnboundedReceiver<Msg>,
         done: impl Fn(&App) -> bool,
@@ -3025,7 +3084,7 @@ pub mod tests {
         }
     }
 
-    fn writes(sent: &[(String, String, String)]) -> Vec<(String, String)> {
+    pub fn writes(sent: &[(String, String, String)]) -> Vec<(String, String)> {
         sent.iter()
             .filter(|(m, p, _)| {
                 m != "GET"
@@ -3524,13 +3583,13 @@ pub mod tests {
             last_reactions(a).iter().any(|r| r.0 == "heart")
         })
         .await;
-        assert_eq!(app.notice, "Reacted ❤️");
+        assert_eq!(app.notice, "Reacted ❤\u{fe0f}");
         press(&mut app, "x2");
         settle(&mut app, &mut rx, |a| {
             !last_reactions(a).iter().any(|r| r.0 == "heart")
         })
         .await;
-        assert_eq!(app.notice, "Removed ❤️");
+        assert_eq!(app.notice, "Removed ❤\u{fe0f}");
         press(&mut app, "X");
         settle(&mut app, &mut rx, |a| {
             last_reactions(a).iter().any(|r| r.0 == "heart")

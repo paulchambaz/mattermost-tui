@@ -106,22 +106,116 @@ impl Line {
     }
 }
 
-/// What a `:` command asks for.
+/// What a `:` command asks for; the text is the argument, empty when none was given.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
     NewServer,
     Help,
     Quit,
+    Server(String),
+    Team(String),
+    Go(String),
+    RemoveServer(String),
+    Reload,
+    MarkRead,
+    MarkAllRead,
+    Users,
+    Reactions,
+    Open,
+    Copy(String),
+    React(String),
+    Set(String, String),
+    Topic,
+    Dm(String),
+    Join(String),
+    Leave,
+    Status(String),
+    Pin,
+    Unpin,
 }
 
-/// Reads a command name; none when it is not one.
-pub fn parse(input: &str) -> Option<Command> {
-    match input.trim() {
-        "new-server" => Some(Command::NewServer),
-        "help" => Some(Command::Help),
-        "quit" | "q" => Some(Command::Quit),
-        _ => None,
+/// Every command with whether it takes an argument, in the order the help lists them.
+pub const COMMANDS: &[(&str, bool)] = &[
+    ("new-server", false),
+    ("remove-server", true),
+    ("server", true),
+    ("team", true),
+    ("go", true),
+    ("dm", true),
+    ("join", true),
+    ("leave", false),
+    ("topic", false),
+    ("reload", false),
+    ("mark-read", false),
+    ("mark-all-read", false),
+    ("users", false),
+    ("reactions", false),
+    ("react", true),
+    ("pin", false),
+    ("unpin", false),
+    ("open", false),
+    ("copy", true),
+    ("status", true),
+    ("set", true),
+    ("help", false),
+    ("quit", false),
+];
+
+/// The commands whose name starts with `word`.
+pub fn starting(word: &str) -> Vec<&'static str> {
+    COMMANDS
+        .iter()
+        .map(|(name, _)| *name)
+        .filter(|name| name.starts_with(word))
+        .collect()
+}
+
+/// The commands `word` can mean: the one it spells out, else those it is the start of.
+pub fn matching(word: &str) -> Vec<&'static str> {
+    match COMMANDS.iter().find(|(name, _)| *name == word) {
+        Some((name, _)) => vec![name],
+        None => starting(word),
     }
+}
+
+/// Reads a command and its argument; none when the name is not one or is the start of several.
+pub fn parse(input: &str) -> Option<Command> {
+    let input = input.trim();
+    let (name, rest) = input.split_once(char::is_whitespace).unwrap_or((input, ""));
+    let name = match matching(name).as_slice() {
+        [only] => *only,
+        _ => return None,
+    };
+    let rest = rest.trim().to_owned();
+    Some(match name {
+        "new-server" => Command::NewServer,
+        "help" => Command::Help,
+        "quit" => Command::Quit,
+        "server" => Command::Server(rest),
+        "team" => Command::Team(rest),
+        "go" => Command::Go(rest),
+        "remove-server" => Command::RemoveServer(rest),
+        "reload" => Command::Reload,
+        "mark-read" => Command::MarkRead,
+        "mark-all-read" => Command::MarkAllRead,
+        "users" => Command::Users,
+        "reactions" => Command::Reactions,
+        "open" => Command::Open,
+        "copy" => Command::Copy(rest),
+        "react" => Command::React(rest),
+        "set" => {
+            let (key, value) = rest.split_once(char::is_whitespace).unwrap_or((&rest, ""));
+            Command::Set(key.to_owned(), value.trim().to_owned())
+        }
+        "topic" => Command::Topic,
+        "dm" => Command::Dm(rest),
+        "join" => Command::Join(rest),
+        "leave" => Command::Leave,
+        "status" => Command::Status(rest),
+        "pin" => Command::Pin,
+        "unpin" => Command::Unpin,
+        _ => return None,
+    })
 }
 
 /// The questions of the new-server wizard, in order.
@@ -301,6 +395,38 @@ mod tests {
         assert_eq!(parse(" new-server "), Some(Command::NewServer));
         assert_eq!(parse("q"), Some(Command::Quit));
         assert_eq!(parse("nope"), None);
+        assert_eq!(parse(""), None);
+    }
+
+    #[test]
+    fn a_command_is_known_by_its_shortest_unambiguous_start() {
+        assert_eq!(parse("ser x"), Some(Command::Server("x".into())));
+        assert_eq!(parse("rel"), Some(Command::Reload));
+        assert_eq!(parse("react tada"), Some(Command::React("tada".into())));
+        assert_eq!(parse("reacti"), Some(Command::Reactions));
+        assert_eq!(parse("s"), None);
+        assert_eq!(parse("se"), None);
+        assert_eq!(parse("set a b"), Some(Command::Set("a".into(), "b".into())));
+        assert_eq!(matching("mark"), ["mark-read", "mark-all-read"]);
+        assert_eq!(starting("react"), ["reactions", "react"]);
+        assert_eq!(matching("react"), ["react"]);
+    }
+
+    #[test]
+    fn arguments_are_the_rest_of_the_line() {
+        assert_eq!(parse("go  town sq "), Some(Command::Go("town sq".into())));
+        assert_eq!(parse("server"), Some(Command::Server(String::new())));
+        assert_eq!(
+            parse("set open.image nsxiv -f"),
+            Some(Command::Set("open.image".into(), "nsxiv -f".into()))
+        );
+        assert_eq!(
+            parse("set copy"),
+            Some(Command::Set("copy".into(), String::new()))
+        );
+        assert_eq!(parse("status dnd"), Some(Command::Status("dnd".into())));
+        assert_eq!(parse("copy full"), Some(Command::Copy("full".into())));
+        assert_eq!(parse("leave"), Some(Command::Leave));
     }
 
     #[test]
