@@ -1,23 +1,26 @@
 //! Application state, the events that change it, and the requests it starts.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
 use crate::api::types::{
-    CategoryList, Channel, ChannelId, ChannelMember, PostId, PostList, Team as WireTeam, TeamId,
-    User, UserId,
+    CategoryList, Channel, ChannelId, ChannelMember, Post, PostId, PostList, Team as WireTeam,
+    TeamId, User, UserId,
 };
 use crate::api::{Client, Error};
 use crate::config::{self, Credentials, ServerConfig};
 use crate::finder;
 use crate::input::{self, Command, Line, Step, Wizard};
 use crate::model::{self, group_start, group_with_previous, Link, Message, Server, Team};
+use crate::term::{self, Pane};
 use crate::unread;
-use crate::ws::{self, Event, Ws};
+use crate::ws::{self, Action, Event, Ws};
 
 /// Everything that can wake the application.
 #[derive(Debug)]
@@ -27,6 +30,10 @@ pub enum Msg {
     Loaded(usize, Loaded),
     LoggedIn(Result<Box<Session>, Error>),
     Ws(usize, Ws),
+    Paste(String),
+    Tick,
+    Pty,
+    EditorDone,
 }
 
 /// The answer to one request, tagged by the server it came from.
@@ -51,6 +58,17 @@ pub enum Loaded {
         asked: usize,
     },
     Users(Vec<User>),
+    Created(Post),
+    Edited(Post),
+    Deleted {
+        channel: ChannelId,
+        id: PostId,
+    },
+    NotSent {
+        channel: ChannelId,
+        text: String,
+        error: String,
+    },
     Viewed,
     Failed(String),
 }
@@ -61,6 +79,37 @@ pub struct Finder {
     pub all: bool,
     pub line: Line,
     pub selected: usize,
+}
+
+/// What the input line is writing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Kind {
+    Message,
+    Reply { root: PostId, to: String },
+    Edit(PostId),
+}
+
+/// The message being written in INSERT mode.
+#[derive(Debug)]
+pub struct Compose {
+    pub line: Line,
+    pub kind: Kind,
+}
+
+/// A question the next key answers.
+#[derive(Debug)]
+enum Awaiting {
+    Delete { channel: ChannelId, id: PostId },
+}
+
+/// The selected message, as the writing keys need it.
+struct Target {
+    id: PostId,
+    root: Option<PostId>,
+    text: String,
+    author: String,
+    own: bool,
+    system: bool,
 }
 
 /// What entering a channel should put under the cursor.
@@ -106,6 +155,14 @@ pub struct App {
     pub wizard: Option<Wizard>,
     pub help: Option<usize>,
     pub finder: Option<Finder>,
+    pub compose: Option<Compose>,
+    pub pane: Option<Pane>,
+    pub size: (u16, u16),
+    editor_cmd: String,
+    editor_fresh: bool,
+    awaiting: Option<Awaiting>,
+    drafts: HashMap<(usize, ChannelId), String>,
+    typed: Option<Instant>,
     pub quit: bool,
     entry: Option<Entry>,
     goal: Goal,
@@ -135,6 +192,17 @@ impl App {
             wizard: None,
             help: None,
             finder: None,
+            compose: None,
+            pane: None,
+            size: (80, 24),
+            editor_cmd: std::env::var("EDITOR")
+                .ok()
+                .filter(|e| !e.is_empty())
+                .unwrap_or_else(|| "vi".into()),
+            editor_fresh: false,
+            awaiting: None,
+            drafts: HashMap::new(),
+            typed: None,
             quit: false,
             entry: None,
             goal: Goal::Unread,
@@ -161,11 +229,20 @@ impl App {
             Msg::Loaded(i, loaded) => self.loaded(i, loaded),
             Msg::LoggedIn(result) => self.logged_in(result),
             Msg::Ws(i, ws) => self.ws(i, ws),
+            Msg::Paste(text) => self.paste(&text),
+            Msg::Tick | Msg::Pty => {}
+            Msg::EditorDone => self.editor_done(),
         }
     }
 
     /// Name of the current mode, written on the status line.
     pub fn mode(&self) -> &'static str {
+        if self.pane.is_some() {
+            return "EDITOR";
+        }
+        if self.compose.is_some() {
+            return "INSERT";
+        }
         match (&self.input, &self.wizard, &self.help, &self.finder) {
             (_, Some(_), ..) => "LOGIN",
             (Some(_), ..) => "COMMAND",
@@ -204,8 +281,23 @@ impl App {
 
     fn key(&mut self, key: KeyEvent) {
         self.notice.clear();
-        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let plain = self.input.is_none()
+            && self.finder.is_none()
+            && self.help.is_none()
+            && self.wizard.is_none();
+        if let Some(pane) = &mut self.pane {
+            pane.send_key(key);
+        } else if key.code == KeyCode::Char('c') && ctrl {
             self.quit = true;
+        } else if let Some(Awaiting::Delete { channel, id }) = self.awaiting.take() {
+            if key.code == KeyCode::Char('y') {
+                self.delete(channel, id);
+            }
+        } else if key.code == KeyCode::Char('g') && ctrl && (plain || self.compose.is_some()) {
+            self.open_editor();
+        } else if self.compose.is_some() {
+            self.compose_key(key);
         } else if self.finder.is_some() {
             self.finder_key(key);
         } else if self.input.is_some() {
@@ -222,6 +314,9 @@ impl App {
         let KeyCode::Char(c) = key.code else {
             return;
         };
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return;
+        }
         match c {
             'q' => self.quit = true,
             ':' => self.input = Some(Line::new(false)),
@@ -237,6 +332,10 @@ impl App {
             'n' => self.next_unread(),
             'N' => self.next_mention(),
             'c' => self.mark_read(),
+            'i' => self.start_compose(Kind::Message, None),
+            'r' => self.reply(),
+            'e' => self.edit(),
+            'd' => self.ask_delete(),
             'f' | 'F' => {
                 self.finder = Some(Finder {
                     all: c == 'F',
@@ -251,6 +350,293 @@ impl App {
             'H' => self.move_team(-1),
             'L' => self.move_team(1),
             _ => {}
+        }
+    }
+
+    fn target(&self) -> Option<Target> {
+        let (server, _) = self.channel()?;
+        let message = self.messages()?.get(self.cursor)?;
+        Some(Target {
+            id: message.id.clone(),
+            root: message.root.clone(),
+            text: message.text.clone(),
+            author: server.username(&message.user).to_owned(),
+            own: server.me.as_ref().is_some_and(|m| m.id == message.user),
+            system: message.system,
+        })
+    }
+
+    fn draft_key(&self) -> Option<(usize, ChannelId)> {
+        self.channel()
+            .map(|(_, chan)| (self.server, chan.info.id.clone()))
+    }
+
+    fn start_compose(&mut self, kind: Kind, text: Option<String>) {
+        let Some(key) = self.draft_key() else {
+            return;
+        };
+        let draft = match kind {
+            Kind::Edit(_) => None,
+            _ => self.drafts.remove(&key),
+        };
+        let text = text.or(draft).unwrap_or_default();
+        self.compose = Some(Compose {
+            line: Line::with_text(&text, false),
+            kind,
+        });
+        self.typed = None;
+    }
+
+    fn reply(&mut self) {
+        let Some(target) = self.target().filter(|t| !t.system) else {
+            return;
+        };
+        self.browsing = true;
+        let root = target.root.unwrap_or(target.id);
+        self.start_compose(
+            Kind::Reply {
+                root,
+                to: target.author,
+            },
+            None,
+        );
+    }
+
+    fn edit(&mut self) {
+        let Some(target) = self.target() else {
+            return;
+        };
+        self.browsing = true;
+        if !target.own || target.system {
+            self.notice = "That is not your message".into();
+            return;
+        }
+        self.start_compose(Kind::Edit(target.id), Some(target.text));
+    }
+
+    fn ask_delete(&mut self) {
+        let (Some(target), Some((_, chan))) = (self.target(), self.channel()) else {
+            return;
+        };
+        let channel = chan.info.id.clone();
+        self.browsing = true;
+        if !target.own || target.system {
+            self.notice = "That is not your message".into();
+            return;
+        }
+        self.notice = "Delete this message?  y = yes, any other key = no".into();
+        self.awaiting = Some(Awaiting::Delete {
+            channel,
+            id: target.id,
+        });
+    }
+
+    fn delete(&mut self, channel: ChannelId, id: PostId) {
+        let Some(client) = self.servers.get(self.server).and_then(|s| s.client.clone()) else {
+            return;
+        };
+        self.spawn(self.server, async move {
+            match client.delete_post(&id).await {
+                Ok(()) => Loaded::Deleted { channel, id },
+                Err(e) => Loaded::Failed(e.to_string()),
+            }
+        });
+    }
+
+    fn compose_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.leave_compose(),
+            KeyCode::Enter => self.send(),
+            _ => {
+                let Some(compose) = &mut self.compose else {
+                    return;
+                };
+                let before = compose.line.text();
+                if compose.line.edit(key) && compose.line.text() != before {
+                    self.ping_typing();
+                }
+            }
+        }
+    }
+
+    fn open_editor(&mut self) {
+        self.editor_fresh = self.compose.is_none();
+        if self.editor_fresh {
+            self.start_compose(Kind::Message, None);
+        }
+        let Some(compose) = &self.compose else {
+            return;
+        };
+        let (_, rows) = term::split(self.size.1);
+        let tx = self.tx.clone();
+        let wake = move |done| {
+            let _ = tx.send(if done { Msg::EditorDone } else { Msg::Pty });
+        };
+        match Pane::spawn(
+            &self.editor_cmd,
+            &compose.line.text(),
+            rows,
+            self.size.0,
+            wake,
+        ) {
+            Ok(pane) => self.pane = Some(pane),
+            Err(e) => {
+                self.notice = format!("Editor: {e}");
+                if self.editor_fresh {
+                    self.leave_compose();
+                }
+            }
+        }
+    }
+
+    fn editor_done(&mut self) {
+        if let Some(pane) = self.pane.take() {
+            self.finished(pane.finish().map_err(|e| e.to_string()));
+        }
+    }
+
+    /// Takes back what the editor saved, or says why it failed.
+    fn finished(&mut self, result: Result<String, String>) {
+        let fresh = std::mem::take(&mut self.editor_fresh);
+        match result {
+            Ok(text) if text.is_empty() && fresh => self.leave_compose(),
+            Ok(text) => {
+                if let Some(compose) = &mut self.compose {
+                    compose.line = Line::with_text(&text, false);
+                    self.ping_typing();
+                }
+            }
+            Err(e) => {
+                self.notice = format!("Editor: {e}");
+                if fresh {
+                    self.leave_compose();
+                }
+            }
+        }
+    }
+
+    fn leave_compose(&mut self) {
+        let (Some(compose), Some(key)) = (self.compose.take(), self.draft_key()) else {
+            return;
+        };
+        self.typed = None;
+        let text = compose.line.text();
+        if compose.kind != Kind::Edit(PostId::default())
+            && !matches!(compose.kind, Kind::Edit(_))
+            && !text.is_empty()
+        {
+            self.drafts.insert(key, text);
+        }
+    }
+
+    fn send(&mut self) {
+        let Some(compose) = &self.compose else {
+            return;
+        };
+        let text = compose.line.text();
+        let message = text.trim().to_owned();
+        if message.is_empty() {
+            return;
+        }
+        if text.starts_with('/') {
+            self.notice = "Slash commands are not supported".into();
+            return;
+        }
+        let kind = compose.kind.clone();
+        let (Some((server, chan)), i) = (self.channel(), self.server) else {
+            return;
+        };
+        let Some(client) = server.client.clone() else {
+            self.notice = format!("{}: not connected", server.name);
+            return;
+        };
+        let channel = chan.info.id.clone();
+        let edited = matches!(kind, Kind::Edit(_));
+        if !edited {
+            if let Some(server) = self.servers.get_mut(i) {
+                server.mark_viewed(&channel);
+            }
+        }
+        self.spawn(i, async move {
+            let sent = match &kind {
+                Kind::Edit(id) => client.edit_post(id, &message).await.map(Loaded::Edited),
+                Kind::Message => client
+                    .create_post(&channel, &message, None)
+                    .await
+                    .map(Loaded::Created),
+                Kind::Reply { root, .. } => client
+                    .create_post(&channel, &message, Some(root))
+                    .await
+                    .map(Loaded::Created),
+            };
+            if sent.is_ok() && !matches!(kind, Kind::Edit(_)) {
+                let _ = client.view(&channel, None).await;
+            }
+            sent.unwrap_or_else(|e| match kind {
+                Kind::Edit(_) => Loaded::Failed(e.to_string()),
+                _ => Loaded::NotSent {
+                    channel,
+                    text: message,
+                    error: e.to_string(),
+                },
+            })
+        });
+        self.compose = match edited {
+            true => None,
+            false => Some(Compose {
+                line: Line::new(false),
+                kind: Kind::Message,
+            }),
+        };
+    }
+
+    fn ping_typing(&mut self) {
+        if self
+            .typed
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(5))
+        {
+            return;
+        }
+        let parent = match self.compose.as_ref().map(|c| &c.kind) {
+            Some(Kind::Message) => None,
+            Some(Kind::Reply { root, .. }) => Some(root.clone()),
+            _ => return,
+        };
+        let Some((server, chan)) = self.channel() else {
+            return;
+        };
+        let Some(actions) = &server.actions else {
+            return;
+        };
+        let channel = chan.info.id.clone();
+        if actions.send(Action::Typing { channel, parent }).is_ok() {
+            self.typed = Some(Instant::now());
+        }
+    }
+
+    fn paste(&mut self, text: &str) {
+        if let Some(pane) = &mut self.pane {
+            return pane.send_paste(text);
+        }
+        let flat = text.replace(['\r', '\n'], " ");
+        if let Some(compose) = &mut self.compose {
+            compose.line.insert_str(&flat);
+            self.ping_typing();
+        } else if let Some(finder) = &mut self.finder {
+            finder.line.insert_str(&flat);
+            finder.selected = 0;
+        } else if let Some(line) = &mut self.input {
+            line.insert_str(&flat);
+        }
+    }
+
+    fn tick_later(&self) {
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let tx = self.tx.clone();
+            runtime.spawn(async move {
+                tokio::time::sleep(Duration::from_secs(6)).await;
+                let _ = tx.send(Msg::Tick);
+            });
         }
     }
 
@@ -401,7 +787,8 @@ impl App {
                 self.team = 0;
                 self.reset_view();
                 self.load_teams(self.server);
-                self.start_ws(self.server);
+                let added = self.server;
+                self.start_ws(added);
             }
             Err(Error::MfaRequired) => {
                 wizard.step = Step::Mfa;
@@ -561,6 +948,40 @@ impl App {
     }
 
     fn loaded(&mut self, i: usize, loaded: Loaded) {
+        let loaded = match loaded {
+            Loaded::Created(post) => {
+                if self.current_id(i).as_ref() == Some(&post.channel_id) {
+                    self.reset_view();
+                }
+                let mentions = Vec::new();
+                return self.apply_event(i, Event::Posted { post, mentions });
+            }
+            Loaded::Edited(post) => return self.apply_event(i, Event::Edited(post)),
+            Loaded::Deleted { channel, id } => {
+                let post = Post {
+                    id,
+                    channel_id: channel,
+                    ..Post::default()
+                };
+                return self.apply_event(i, Event::Deleted(post));
+            }
+            Loaded::NotSent {
+                channel,
+                text,
+                error,
+            } => {
+                let kept = self
+                    .drafts
+                    .remove(&(i, channel.clone()))
+                    .unwrap_or_default();
+                let draft = format!("{text} {kept}").trim_end().to_owned();
+                self.drafts.insert((i, channel), draft);
+                let name = self.servers.get(i).map_or("", |s| s.name.as_str());
+                self.notice = format!("{name}: {error} (kept as a draft)");
+                return;
+            }
+            other => other,
+        };
         let current = self.current_id(i);
         let Some(server) = self.servers.get_mut(i) else {
             return;
@@ -684,7 +1105,11 @@ impl App {
                     }
                 }
             }
-            Loaded::Viewed => {}
+            Loaded::Created(_)
+            | Loaded::Edited(_)
+            | Loaded::Deleted { .. }
+            | Loaded::NotSent { .. }
+            | Loaded::Viewed => {}
             Loaded::Users(users) => {
                 server
                     .users
@@ -753,6 +1178,7 @@ impl App {
         };
         let me = server.me.as_ref().map(|m| m.id.clone());
         let (mut touched, mut removed, mut refresh, mut view) = (None, None, false, None);
+        let mut typed = false;
         let (mut added, mut dropped) = (false, 0);
         let mut ids = Vec::new();
         match event {
@@ -772,10 +1198,17 @@ impl App {
                         member.mention_count += 1;
                     }
                 }
-                if mine || current.as_ref() == Some(&channel) {
+                let fresh = server
+                    .messages
+                    .get(&channel)
+                    .is_none_or(|l| l.iter().all(|m| m.id != post.id));
+                if fresh && (mine || current.as_ref() == Some(&channel)) {
                     server.mark_viewed(&channel);
+                }
+                if fresh && !mine && current.as_ref() == Some(&channel) {
                     view = Some(channel.clone());
                 }
+                server.stopped(&channel, &post.user_id);
                 refresh = !known && server.refreshed.insert(channel.clone());
                 ids = server.unknown(std::iter::once(&post.user_id));
                 if let Some(list) = server.messages.get_mut(&channel) {
@@ -812,9 +1245,18 @@ impl App {
                     .for_each(|l| model::unreact(l, &reaction));
             }
             Event::Viewed(channel) => server.mark_viewed(&channel),
+            Event::Typing { channel, user } => {
+                if me.as_ref() != Some(&user) {
+                    server.typed(&channel, &user, Instant::now());
+                    typed = true;
+                }
+            }
         }
         if refresh {
             self.refresh_channels(i);
+        }
+        if typed {
+            self.tick_later();
         }
         if let Some(channel) = view.filter(|c| current.as_ref() == Some(c)) {
             self.send_view(i, channel, None);
@@ -1059,12 +1501,17 @@ impl App {
         });
     }
 
-    fn start_ws(&self, i: usize) {
-        let Some(client) = self.servers.get(i).and_then(|s| s.client.clone()) else {
+    fn start_ws(&mut self, i: usize) {
+        let tx = self.tx.clone();
+        let Some(server) = self.servers.get_mut(i) else {
             return;
         };
-        let tx = self.tx.clone();
-        tokio::spawn(ws::run(client, ws::BACKOFF, move |event| {
+        let Some(client) = server.client.clone() else {
+            return;
+        };
+        let (actions, receiver) = unbounded_channel();
+        server.actions = Some(actions);
+        tokio::spawn(ws::run(client, ws::BACKOFF, receiver, move |event| {
             tx.send(Msg::Ws(i, event)).is_ok()
         }));
     }
@@ -1155,8 +1602,13 @@ pub mod tests {
     }
 
     pub fn fixture() -> App {
-        let (tx, rx) = unbounded_channel();
+        let (app, rx) = fixture_rx();
         std::mem::forget(rx);
+        app
+    }
+
+    fn fixture_rx() -> (App, tokio::sync::mpsc::UnboundedReceiver<Msg>) {
+        let (tx, rx) = unbounded_channel();
         let config = ServerConfig {
             name: "work".into(),
             url: "https://chat.example.org".into(),
@@ -1201,7 +1653,7 @@ pub mod tests {
                 list,
             },
         );
-        app
+        (app, rx)
     }
 
     fn json<T: DeserializeOwned>(name: &str) -> T {
@@ -1945,5 +2397,507 @@ pub mod tests {
         press_code(&mut app, KeyCode::Esc);
         press(&mut app, "Fhome#k");
         assert_eq!(app.finder_targets(), [(1, 0, 1)]);
+    }
+
+    fn new_post(id: &str, user: &str, text: &str, root: &str, ms: i64) -> serde_json::Value {
+        serde_json::json!({
+            "id": id, "create_at": ms, "user_id": user, "channel_id": "c3",
+            "message": text, "root_id": root
+        })
+    }
+
+    async fn writing() -> (
+        App,
+        tokio::sync::mpsc::UnboundedReceiver<Msg>,
+        wiremock::MockServer,
+    ) {
+        use wiremock::matchers::{any, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let reply = |post| ResponseTemplate::new(201).set_body_json(post);
+        Mock::given(method("POST"))
+            .and(path("/api/v4/posts"))
+            .respond_with(reply(new_post(
+                "new1",
+                "u1",
+                "hello there",
+                "",
+                1_700_000_500_000,
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v4/posts/p1/patch"))
+            .respond_with(reply(new_post(
+                "p1",
+                "u1",
+                "new text",
+                "",
+                1_700_000_000_000,
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(any())
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"status": "OK"})),
+            )
+            .mount(&server)
+            .await;
+        let (mut app, rx) = fixture_rx();
+        let client = Client::connect(&server.uri(), Credentials::Token("t".into()), None)
+            .await
+            .unwrap();
+        app.servers[0].client = Some(Arc::new(client));
+        (app, rx, server)
+    }
+
+    async fn settle(
+        app: &mut App,
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<Msg>,
+        done: impl Fn(&App) -> bool,
+    ) {
+        while !done(app) {
+            let waited = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await;
+            match waited {
+                Ok(Some(msg)) => app.update(msg),
+                _ => panic!("the expected change never came"),
+            }
+        }
+    }
+
+    fn writes(sent: &[(String, String, String)]) -> Vec<(String, String)> {
+        sent.iter()
+            .filter(|(m, p, _)| m != "GET" && !p.ends_with("/view") && !p.ends_with("/users/ids"))
+            .map(|(m, p, b)| (format!("{m} {p}"), b.clone()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_message_is_sent_once_shown_once_and_the_input_stays_open() {
+        let (mut app, mut rx, server) = writing().await;
+        press(&mut app, "ihello there");
+        press_code(&mut app, KeyCode::Enter);
+        assert_eq!(
+            (app.mode(), app.compose.as_ref().unwrap().line.text()),
+            ("INSERT", String::new())
+        );
+        settle(&mut app, &mut rx, |a| {
+            a.messages()
+                .is_some_and(|m| m.iter().any(|m| m.id.0 == "new1"))
+        })
+        .await;
+        assert!(text(&mut app).contains("hello there"));
+        posted(
+            &mut app,
+            post("new1", "c3", "u1", "hello there", 1_700_000_500_000),
+            &[],
+        );
+        assert_eq!(ids(&app).iter().filter(|id| *id == "new1").count(), 1);
+        let sent = writes(&sent(&server).await);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].0, "POST /api/v4/posts");
+        let body: serde_json::Value = serde_json::from_str(&sent[0].1).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"channel_id": "c3", "message": "hello there", "root_id": ""})
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_and_slash_messages_are_not_sent() {
+        let (mut app, _rx, server) = writing().await;
+        press(&mut app, "i   ");
+        press_code(&mut app, KeyCode::Enter);
+        assert!(writes(&sent(&server).await).is_empty());
+        app.compose.as_mut().unwrap().line = Line::with_text("/join town", false);
+        press_code(&mut app, KeyCode::Enter);
+        assert_eq!(app.notice, "Slash commands are not supported");
+        assert!(writes(&sent(&server).await).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_reply_goes_to_the_thread_root() {
+        let (mut app, _rx, server) = writing().await;
+        posted(
+            &mut app,
+            post("p5", "c3", "u2", "root", 1_700_000_100_000),
+            &[],
+        );
+        let mut reply = post("p6", "c3", "u2", "answer", 1_700_000_200_000);
+        reply.root_id = "p5".into();
+        posted(&mut app, reply, &[]);
+        press(&mut app, "r");
+        assert_eq!(
+            screen(&mut app, 80, 14).iter().nth_back(1).unwrap(),
+            " ↪ ana >"
+        );
+        press(&mut app, "one");
+        press_code(&mut app, KeyCode::Enter);
+        press_code(&mut app, KeyCode::Esc);
+        app.cursor = app.count() - 2;
+        press(&mut app, "rtwo");
+        press_code(&mut app, KeyCode::Enter);
+        let sent = writes(&sent(&server).await);
+        let roots: Vec<String> = sent
+            .iter()
+            .map(|(_, b)| {
+                serde_json::from_str::<serde_json::Value>(b).unwrap()["root_id"].to_string()
+            })
+            .collect();
+        assert_eq!(roots, ["\"p5\"", "\"p5\""]);
+    }
+
+    #[tokio::test]
+    async fn only_your_own_messages_can_be_edited_and_the_edit_is_a_patch() {
+        let (mut app, mut rx, server) = writing().await;
+        press(&mut app, "e");
+        assert_eq!(app.notice, "That is not your message");
+        assert!(app.compose.is_none());
+        app.cursor = 0;
+        press(&mut app, "e");
+        assert_eq!(app.compose.as_ref().unwrap().line.text(), "hello :tada:");
+        assert_eq!(
+            screen(&mut app, 80, 14).iter().nth_back(1).unwrap(),
+            " ✎ edit > hello :tada:"
+        );
+        app.compose.as_mut().unwrap().line = Line::with_text("new text", false);
+        press_code(&mut app, KeyCode::Enter);
+        assert_eq!(app.mode(), "NORMAL");
+        settle(&mut app, &mut rx, |a| {
+            a.messages().is_some_and(|m| m[0].text == "new text")
+        })
+        .await;
+        let sent = writes(&sent(&server).await);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, "PUT /api/v4/posts/p1/patch");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&sent[0].1).unwrap(),
+            serde_json::json!({"message": "new text"})
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_asks_first_and_only_y_deletes() {
+        let (mut app, mut rx, server) = writing().await;
+        app.cursor = 0;
+        press(&mut app, "dn");
+        assert!(writes(&sent(&server).await).is_empty());
+        assert_eq!(ids(&app), ["p1", "p2"]);
+        press(&mut app, "d");
+        assert_eq!(
+            app.notice,
+            "Delete this message?  y = yes, any other key = no"
+        );
+        press(&mut app, "y");
+        settle(&mut app, &mut rx, |a| a.count() == 1).await;
+        assert_eq!(ids(&app), ["p2"]);
+        assert_eq!(writes(&sent(&server).await)[0].0, "DELETE /api/v4/posts/p1");
+        press(&mut app, "d");
+        assert_eq!(app.notice, "That is not your message");
+        press(&mut app, "y");
+        assert_eq!(writes(&sent(&server).await).len(), 1);
+    }
+
+    #[test]
+    fn a_draft_is_kept_per_channel_and_a_failed_send_gives_the_text_back() {
+        let mut app = fixture();
+        press(&mut app, "idraft one");
+        press_code(&mut app, KeyCode::Esc);
+        assert_eq!(app.mode(), "NORMAL");
+        press(&mut app, "i");
+        assert_eq!(app.compose.as_ref().unwrap().line.text(), "draft one");
+        press_code(&mut app, KeyCode::Esc);
+        press(&mut app, "Ji");
+        assert_eq!(app.compose.as_ref().unwrap().line.text(), "");
+        press_code(&mut app, KeyCode::Esc);
+        app.loaded(
+            0,
+            Loaded::NotSent {
+                channel: ChannelId("c1".into()),
+                text: "lost words".into(),
+                error: "timeout".into(),
+            },
+        );
+        assert_eq!(app.notice, "work: timeout (kept as a draft)");
+        press(&mut app, "i");
+        assert_eq!(app.compose.as_ref().unwrap().line.text(), "lost words");
+    }
+
+    #[test]
+    fn a_paste_never_sends_and_loses_its_line_breaks() {
+        let mut app = fixture();
+        press(&mut app, "ix ");
+        app.update(Msg::Paste("a\nb\r\nc".into()));
+        assert_eq!(app.compose.as_ref().unwrap().line.text(), "x a b  c");
+        app.update(Msg::Key(key(KeyCode::Esc)));
+        app.update(Msg::Paste("ignored".into()));
+        assert!(app.compose.is_none() && app.input.is_none());
+    }
+
+    #[test]
+    fn typing_is_announced_once_per_input_session_and_never_while_editing() {
+        let mut app = fixture();
+        let (actions, mut seen) = unbounded_channel();
+        app.servers[0].actions = Some(actions);
+        press(&mut app, "iabc");
+        assert!(matches!(
+            seen.try_recv(),
+            Ok(Action::Typing { parent: None, .. })
+        ));
+        assert!(seen.try_recv().is_err());
+        press_code(&mut app, KeyCode::Esc);
+        press(&mut app, "id");
+        assert!(seen.try_recv().is_ok());
+        press_code(&mut app, KeyCode::Esc);
+        app.cursor = 0;
+        press(&mut app, "ex");
+        assert!(seen.try_recv().is_err());
+    }
+
+    #[test]
+    fn who_is_typing_shows_on_the_status_line_until_they_stop_or_expire() {
+        let mut app = fixture();
+        let (channel, ana) = (ChannelId("c3".into()), UserId("u2".into()));
+        app.apply_event(
+            0,
+            Event::Typing {
+                channel: channel.clone(),
+                user: ana.clone(),
+            },
+        );
+        let status = screen(&mut app, 80, 14).pop().unwrap();
+        assert!(status.contains("✎ ana"), "{status:?}");
+        posted(
+            &mut app,
+            post("p9", "c3", "u2", "done", 1_700_000_900_000),
+            &[],
+        );
+        assert!(!screen(&mut app, 80, 14).pop().unwrap().contains("✎"));
+        let old = Instant::now().checked_sub(Duration::from_secs(10)).unwrap();
+        app.servers[0].typing.insert(channel, vec![(ana, old)]);
+        assert!(!screen(&mut app, 80, 14).pop().unwrap().contains("✎"));
+        let me = UserId("u1".into());
+        app.apply_event(
+            0,
+            Event::Typing {
+                channel: ChannelId("c3".into()),
+                user: me,
+            },
+        );
+        assert!(!screen(&mut app, 80, 14).pop().unwrap().contains("✎"));
+    }
+
+    #[tokio::test]
+    async fn a_writing_session_only_makes_the_permitted_writes() {
+        let (mut app, mut rx, server) = writing().await;
+        press(&mut app, "ione");
+        press_code(&mut app, KeyCode::Enter);
+        press_code(&mut app, KeyCode::Esc);
+        app.cursor = 0;
+        press(&mut app, "e");
+        press_code(&mut app, KeyCode::Enter);
+        press(&mut app, "dy");
+        settle(&mut app, &mut rx, |a| a.count() < 3).await;
+        let allowed = [
+            "POST /api/v4/posts",
+            "PUT /api/v4/posts/p1/patch",
+            "DELETE /api/v4/posts/p1",
+        ];
+        for (request, _) in writes(&sent(&server).await) {
+            assert!(allowed.contains(&request.as_str()), "{request}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sending_marks_the_channel_viewed_right_after_the_post_and_only_once() {
+        let (mut app, mut rx, server) = writing().await;
+        press(&mut app, "ihello there");
+        press_code(&mut app, KeyCode::Enter);
+        settle(&mut app, &mut rx, |a| {
+            a.messages()
+                .is_some_and(|m| m.iter().any(|m| m.id.0 == "new1"))
+        })
+        .await;
+        posted(
+            &mut app,
+            post("new1", "c3", "u1", "hello there", 1_700_000_500_000),
+            &[],
+        );
+        let sent = sent(&server).await;
+        let order: Vec<&str> = sent
+            .iter()
+            .filter(|(m, p, _)| m == "POST" && (p == "/api/v4/posts" || p.ends_with("/view")))
+            .map(|(_, p, _)| p.as_str())
+            .collect();
+        assert_eq!(order, ["/api/v4/posts", "/api/v4/channels/members/me/view"]);
+        assert_eq!(
+            views(&sent),
+            [serde_json::json!({"channel_id": "c3", "prev_channel_id": ""})]
+        );
+    }
+
+    fn ctrl(c: char) -> Msg {
+        Msg::Key(KeyEvent {
+            code: KeyCode::Char(c),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        })
+    }
+
+    fn editor(app: &mut App, body: &str) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("editor.sh");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        app.editor_cmd = path.to_string_lossy().into_owned();
+        dir
+    }
+
+    fn until_screen(app: &mut App, wanted: &str) -> Vec<String> {
+        for _ in 0..100 {
+            let lines = screen(app, 60, 16);
+            if lines.iter().any(|l| l.contains(wanted)) {
+                return lines;
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        panic!("{wanted:?} never appeared");
+    }
+
+    #[test]
+    fn ctrl_g_from_normal_mode_opens_the_editor_in_the_lower_half() {
+        let mut app = fixture();
+        let _dir = editor(&mut app, "printf 'IN-THE-EDITOR'; sleep 30");
+        app.update(ctrl('g'));
+        assert_eq!(app.mode(), "EDITOR");
+        let lines = until_screen(&mut app, "IN-THE-EDITOR");
+        let row = lines
+            .iter()
+            .position(|l| l.contains("IN-THE-EDITOR"))
+            .unwrap();
+        assert!(row >= lines.len() / 2, "{row}");
+        assert!(
+            lines.iter().take(row).any(|l| l.contains("hello")),
+            "{lines:?}"
+        );
+        assert!(lines.last().unwrap().starts_with(" EDITOR"));
+        let (pane_rows, _) = app.pane.as_ref().unwrap().size();
+        assert_eq!(pane_rows, term::split(16).1);
+    }
+
+    #[test]
+    fn the_conversation_stays_alive_above_the_editor() {
+        let mut app = fixture();
+        let _dir = editor(&mut app, "printf 'EDITING'; sleep 30");
+        app.update(ctrl('g'));
+        until_screen(&mut app, "EDITING");
+        posted(
+            &mut app,
+            post(
+                "p50",
+                "c3",
+                "u2",
+                "arrived while editing",
+                1_700_000_900_000,
+            ),
+            &[],
+        );
+        until_screen(&mut app, "arrived while editing");
+    }
+
+    #[test]
+    fn keys_go_to_the_editor_and_its_result_lands_in_the_input_line() {
+        let (mut app, mut rx) = fixture_rx();
+        let _dir = editor(
+            &mut app,
+            "IFS= read -r a\nprintf '%s\\n%s\\n' \"$a\" second > \"$1\"",
+        );
+        app.update(ctrl('g'));
+        press(&mut app, "q");
+        assert!(!app.quit);
+        press(&mut app, "ix");
+        press_code(&mut app, KeyCode::Enter);
+        while app.pane.is_some() {
+            let msg = rx.blocking_recv().unwrap();
+            app.update(msg);
+        }
+        assert_eq!(app.mode(), "INSERT");
+        assert_eq!(app.compose.as_ref().unwrap().line.text(), "qix\nsecond");
+        let row = screen(&mut app, 60, 12).iter().nth_back(1).unwrap().clone();
+        assert_eq!(row, " > qix⏎second");
+    }
+
+    #[test]
+    fn an_empty_result_from_normal_mode_cancels_and_keeps_the_draft() {
+        let (mut app, mut rx) = fixture_rx();
+        press(&mut app, "idraft");
+        press_code(&mut app, KeyCode::Esc);
+        let _dir = editor(&mut app, ": > \"$1\"");
+        app.update(ctrl('g'));
+        while app.pane.is_some() {
+            let msg = rx.blocking_recv().unwrap();
+            app.update(msg);
+        }
+        assert!(app.compose.is_none());
+        press(&mut app, "i");
+        assert_eq!(app.compose.as_ref().unwrap().line.text(), "draft");
+        let (mut app, mut rx) = fixture_rx();
+        let _dir = editor(&mut app, ": > \"$1\"");
+        app.update(ctrl('g'));
+        while app.pane.is_some() {
+            let msg = rx.blocking_recv().unwrap();
+            app.update(msg);
+        }
+        assert_eq!(app.mode(), "NORMAL");
+    }
+
+    #[test]
+    fn a_failing_editor_says_so_and_a_normal_mode_start_is_undone() {
+        let (mut app, mut rx) = fixture_rx();
+        let _dir = editor(&mut app, "exit 1");
+        app.update(ctrl('g'));
+        while app.pane.is_some() {
+            let msg = rx.blocking_recv().unwrap();
+            app.update(msg);
+        }
+        assert!(
+            app.notice.starts_with("Editor: the editor exited"),
+            "{}",
+            app.notice
+        );
+        assert_eq!(app.mode(), "NORMAL");
+    }
+
+    #[test]
+    fn ctrl_keys_do_nothing_in_normal_mode_and_ctrl_g_needs_a_plain_screen() {
+        let mut app = fixture();
+        app.update(ctrl('d'));
+        assert!(app.notice.is_empty() && app.awaiting.is_none());
+        press(&mut app, "f");
+        app.update(ctrl('g'));
+        assert!(app.pane.is_none());
+        assert_eq!(app.mode(), "SEARCH");
+    }
+
+    #[test]
+    fn a_pasted_text_goes_to_the_editor_not_to_the_line() {
+        let mut app = fixture();
+        let _dir = editor(&mut app, "sleep 30");
+        app.update(ctrl('g'));
+        app.update(Msg::Paste("pasted".into()));
+        assert_eq!(app.compose.as_ref().unwrap().line.text(), "");
+    }
+
+    #[tokio::test]
+    async fn a_message_written_in_the_editor_is_sent_with_its_line_breaks() {
+        let (mut app, _rx, server) = writing().await;
+        press(&mut app, "i");
+        app.finished(Ok("first\n\nsecond".into()));
+        press_code(&mut app, KeyCode::Enter);
+        let sent = writes(&sent(&server).await);
+        let body: serde_json::Value = serde_json::from_str(&sent[0].1).unwrap();
+        assert_eq!(body["message"], "first\n\nsecond");
     }
 }

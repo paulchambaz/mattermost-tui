@@ -21,6 +21,24 @@ impl Line {
         }
     }
 
+    /// A line that already holds `text`, with the cursor after it.
+    pub fn with_text(text: &str, masked: bool) -> Self {
+        let mut line = Self::new(masked);
+        line.insert_str(text);
+        line
+    }
+
+    /// Inserts text at the cursor, as a paste does.
+    pub fn insert_str(&mut self, text: &str) {
+        let added: Vec<char> = text
+            .chars()
+            .filter(|c| *c == '\n' || !c.is_control())
+            .collect();
+        let count = added.len();
+        self.chars.splice(self.cursor..self.cursor, added);
+        self.cursor += count;
+    }
+
     /// What was typed.
     pub fn text(&self) -> String {
         self.chars.iter().collect()
@@ -30,7 +48,11 @@ impl Line {
     pub fn shown(&self) -> String {
         match self.masked {
             true => self.chars.iter().map(|_| '•').collect(),
-            false => self.text(),
+            false => self
+                .chars
+                .iter()
+                .map(|&c| if c == '\n' { '⏎' } else { c })
+                .collect(),
         }
     }
 
@@ -242,6 +264,18 @@ mod tests {
         assert_eq!(line.text(), "ello");
         line.edit(key(KeyCode::Backspace));
         assert_eq!(line.cursor(), 0);
+    }
+
+    #[test]
+    fn inserted_text_keeps_line_breaks_and_drops_other_control_characters() {
+        let mut line = Line::with_text("hello world", false);
+        for _ in 0..6 {
+            line.edit(key(KeyCode::Left));
+        }
+        line.insert_str("big\n\tone ");
+        assert_eq!(line.text(), "hellobig\none  world");
+        assert_eq!(line.shown(), "hellobig⏎one  world");
+        assert_eq!(line.cursor(), 13);
     }
 
     #[test]

@@ -1,4 +1,6 @@
-//! Read-only Mattermost REST client with automatic re-login.
+//! Mattermost REST client with automatic re-login.
+//!
+//! Everything it does is a read except `view`, `create_post`, `edit_post` and `delete_post`.
 
 /// Wire types of the REST API.
 pub mod types;
@@ -12,7 +14,8 @@ use thiserror::Error;
 
 use crate::config::Credentials;
 use types::{
-    CategoryList, Channel, ChannelId, ChannelMember, PostId, PostList, Team, TeamId, User, UserId,
+    CategoryList, Channel, ChannelId, ChannelMember, Post, PostId, PostList, Team, TeamId, User,
+    UserId,
 };
 
 /// Everything that can go wrong talking to a server.
@@ -150,6 +153,54 @@ impl Client {
         let _: serde_json::Value = self
             .fetch(Method::POST, "/channels/members/me/view", &[], Some(&body))
             .await?;
+        Ok(())
+    }
+
+    /// Creates a post, as a reply in the thread of `root` when there is one.
+    ///
+    /// # Errors
+    /// Fails on network or server errors, for example a message that is too long.
+    pub async fn create_post(
+        &self,
+        channel: &ChannelId,
+        message: &str,
+        root: Option<&PostId>,
+    ) -> Result<Post, Error> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            channel_id: &'a str,
+            message: &'a str,
+            root_id: &'a str,
+        }
+        let body = Body {
+            channel_id: &channel.0,
+            message,
+            root_id: root.map_or("", |r| r.0.as_str()),
+        };
+        self.fetch(Method::POST, "/posts", &[], Some(&body)).await
+    }
+
+    /// Replaces the text of one of the reader's posts.
+    ///
+    /// # Errors
+    /// Fails on network or server errors, and when the server does not allow the edit.
+    pub async fn edit_post(&self, id: &PostId, message: &str) -> Result<Post, Error> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            message: &'a str,
+        }
+        let path = format!("/posts/{}/patch", id.0);
+        self.fetch(Method::PUT, &path, &[], Some(&Body { message }))
+            .await
+    }
+
+    /// Deletes one of the reader's posts.
+    ///
+    /// # Errors
+    /// Fails on network or server errors, and when the server does not allow the deletion.
+    pub async fn delete_post(&self, id: &PostId) -> Result<(), Error> {
+        let path = format!("/posts/{}", id.0);
+        let _: serde_json::Value = self.fetch(Method::DELETE, &path, &[], None::<&()>).await?;
         Ok(())
     }
 
@@ -457,6 +508,60 @@ mod tests {
             .await
             .unwrap();
         assert!(list.order.is_empty());
+    }
+
+    fn post_json(id: &str) -> serde_json::Value {
+        serde_json::json!({"id": id, "create_at": 1, "user_id": "u1", "channel_id": "c1", "message": "hi"})
+    }
+
+    #[tokio::test]
+    async fn writing_calls_send_the_documented_bodies() {
+        use wiremock::matchers::body_json;
+        let server = MockServer::start().await;
+        for (verb, route, body) in [
+            (
+                "POST",
+                "/api/v4/posts",
+                serde_json::json!({"channel_id": "c1", "message": "hi", "root_id": ""}),
+            ),
+            (
+                "POST",
+                "/api/v4/posts",
+                serde_json::json!({"channel_id": "c1", "message": "re", "root_id": "p0"}),
+            ),
+            (
+                "PUT",
+                "/api/v4/posts/p1/patch",
+                serde_json::json!({"message": "fix"}),
+            ),
+        ] {
+            Mock::given(method(verb))
+                .and(path(route))
+                .and(body_json(body))
+                .respond_with(ResponseTemplate::new(200).set_body_json(post_json("p1")))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("DELETE"))
+            .and(path("/api/v4/posts/p1"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"status": "OK"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = Client::connect(&server.uri(), Credentials::Token("t".into()), None)
+            .await
+            .unwrap();
+        let channel = ChannelId("c1".into());
+        client.create_post(&channel, "hi", None).await.unwrap();
+        client
+            .create_post(&channel, "re", Some(&PostId("p0".into())))
+            .await
+            .unwrap();
+        client.edit_post(&PostId("p1".into()), "fix").await.unwrap();
+        client.delete_post(&PostId("p1".into())).await.unwrap();
     }
 
     #[tokio::test]

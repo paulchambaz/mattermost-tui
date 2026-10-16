@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Datelike, Local, TimeZone};
 
@@ -10,11 +11,14 @@ use crate::api::types::{
     Team as WireTeam, User, UserId,
 };
 use crate::api::Client;
+use crate::ws::Action;
 
 /// Posts asked for at a time.
 pub const PAGE: usize = 60;
 /// Most messages kept for one channel.
 pub const MAX_MESSAGES: usize = 500;
+/// How long someone counts as typing after their last typing event.
+const TYPING: Duration = Duration::from_secs(5);
 const GROUP_WINDOW_MS: i64 = 5 * 60 * 1000;
 const PALETTE: [u8; 12] = [1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 14];
 
@@ -331,6 +335,8 @@ pub struct Server {
     pub refreshed: HashSet<ChannelId>,
     pub complete: HashSet<ChannelId>,
     pub paging: HashSet<ChannelId>,
+    pub typing: HashMap<ChannelId, Vec<(UserId, Instant)>>,
+    pub actions: Option<tokio::sync::mpsc::UnboundedSender<Action>>,
     pub link: Link,
 }
 
@@ -349,6 +355,8 @@ impl Server {
             refreshed: HashSet::new(),
             complete: HashSet::new(),
             paging: HashSet::new(),
+            typing: HashMap::new(),
+            actions: None,
             link: Link::Connecting,
         }
     }
@@ -378,6 +386,30 @@ impl Server {
             },
             _ => name.clone(),
         }
+    }
+
+    /// Notes that a user is typing in a channel.
+    pub fn typed(&mut self, channel: &ChannelId, user: &UserId, at: Instant) {
+        let list = self.typing.entry(channel.clone()).or_default();
+        match list.iter_mut().find(|(u, _)| u == user) {
+            Some(entry) => entry.1 = at,
+            None => list.push((user.clone(), at)),
+        }
+    }
+
+    /// Notes that a user stopped typing, for example because their message arrived.
+    pub fn stopped(&mut self, channel: &ChannelId, user: &UserId) {
+        if let Some(list) = self.typing.get_mut(channel) {
+            list.retain(|(u, _)| u != user);
+        }
+    }
+
+    /// The names of the users who typed in a channel in the last few seconds.
+    pub fn typing_names(&self, channel: &ChannelId, now: Instant) -> Vec<&str> {
+        let list = self.typing.get(channel).into_iter().flatten();
+        list.filter(|(_, at)| now.saturating_duration_since(*at) < TYPING)
+            .map(|(user, _)| self.username(user))
+            .collect()
     }
 
     /// Keeps only the newest page of a channel that is no longer open.
@@ -699,5 +731,32 @@ mod tests {
         server.complete.insert(id.clone());
         server.trim(&id);
         assert!(server.complete.contains(&id));
+    }
+
+    #[test]
+    fn typing_expires_and_stops_with_a_message() {
+        let mut server = Server::new("work".into());
+        let (channel, ana, bob) = (
+            ChannelId("c".into()),
+            UserId("u2".into()),
+            UserId("u3".into()),
+        );
+        server.users.insert(
+            ana.clone(),
+            User {
+                id: ana.clone(),
+                username: "ana".into(),
+            },
+        );
+        let now = Instant::now();
+        server.typed(&channel, &ana, now);
+        server.typed(&channel, &bob, now - Duration::from_secs(9));
+        server.typed(&channel, &ana, now);
+        assert_eq!(server.typing_names(&channel, now), ["ana"]);
+        assert!(server
+            .typing_names(&channel, now + Duration::from_secs(6))
+            .is_empty());
+        server.stopped(&channel, &ana);
+        assert!(server.typing_names(&channel, now).is_empty());
     }
 }

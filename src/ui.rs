@@ -1,16 +1,19 @@
 //! Drawing: the tab strip, the log, the status line, the input row and the help page.
 
+use std::time::Instant;
+
 use chrono::Local;
-use ratatui::layout::{Constraint, Layout, Position};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::App;
+use crate::app::{App, Kind};
 use crate::finder;
 use crate::model::{self, group_with_previous, Link, Message, Server};
+use crate::term;
 use crate::unread;
 
 const MARGIN: usize = 1;
@@ -33,6 +36,17 @@ const BINDINGS: &[(&str, &str)] = &[
     ("N", "next mention, across all teams and servers"),
     ("c", "mark the open channel as read"),
     ("f F", "find a channel: f in this team, F everywhere"),
+    (
+        "i",
+        "write a message: enter sends, esc leaves (the text is kept)",
+    ),
+    (
+        "ctrl-g",
+        "write the message in $EDITOR, in the lower half of the screen",
+    ),
+    ("r", "reply in the thread of the selected message"),
+    ("e", "edit your selected message"),
+    ("d", "delete your selected message, y confirms"),
     ("a", "reactions under the messages"),
     ("q", "quit"),
 ];
@@ -531,6 +545,7 @@ fn status_line(app: &App, width: usize, percent: usize) -> Line<'static> {
         };
         let count = app.messages().map_or(0, <[Message]>::len);
         let offline = if server_down(app) { "offline  " } else { "" };
+        let offline = format!("{}{offline}", typing_names(app));
         let right = match count {
             0 => format!("{offline}? help "),
             _ => format!(
@@ -665,6 +680,62 @@ fn wildmenu(app: &App, width: usize) -> Line<'static> {
     Line::from(spans)
 }
 
+fn compose_title(kind: &Kind) -> String {
+    match kind {
+        Kind::Message => "New message".into(),
+        Kind::Reply { to, .. } => format!("Reply to {}", truncate(to, 20)),
+        Kind::Edit(_) => "Editing your message".into(),
+    }
+}
+
+fn compose_label(kind: &Kind) -> String {
+    match kind {
+        Kind::Message => String::new(),
+        Kind::Reply { to, .. } => format!("↪ {} ", truncate(to, 12)),
+        Kind::Edit(_) => "✎ edit ".into(),
+    }
+}
+
+/// The part of an input that fits in `room` cells with the cursor inside, and the cursor's column in it.
+fn visible(shown: &str, cursor: usize, room: usize) -> (String, usize) {
+    let chars: Vec<char> = shown.chars().collect();
+    let cells = |c: &char| c.width().unwrap_or(0);
+    let room = room.max(2);
+    let before: usize = chars[..cursor.min(chars.len())].iter().map(cells).sum();
+    let (mut start, mut skipped) = (0, 0);
+    while before - skipped >= room {
+        skipped += cells(&chars[start]);
+        start += 1;
+    }
+    let (mut text, mut used) = (String::new(), 0);
+    for c in &chars[start..] {
+        if used + cells(c) > room {
+            break;
+        }
+        text.push(*c);
+        used += cells(c);
+    }
+    (text, before - skipped)
+}
+
+fn typing_names(app: &App) -> String {
+    let Some((server, chan)) = app.channel() else {
+        return String::new();
+    };
+    let names = server.typing_names(&chan.info.id, Instant::now());
+    if names.is_empty() {
+        return String::new();
+    }
+    let shown = names.iter().take(3).copied().collect::<Vec<_>>().join(", ");
+    let more = names.len().saturating_sub(3);
+    let more = if more > 0 {
+        format!(" +{more}")
+    } else {
+        String::new()
+    };
+    format!("✎ {shown}{more}  ")
+}
+
 fn help_lines() -> Vec<Line<'static>> {
     let section = |title: &str, rows: &[(&str, &str)]| {
         let heading = Line::styled(
@@ -691,10 +762,15 @@ fn help_lines() -> Vec<Line<'static>> {
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     let width = usize::from(area.width);
+    app.size = (area.width, area.height);
+    let editor_rows = match app.pane {
+        Some(_) => term::split(area.height).1 + 1,
+        None => 1,
+    };
     let [tabs, body, input, status] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
-        Constraint::Length(1),
+        Constraint::Length(editor_rows),
         Constraint::Length(1),
     ])
     .areas(area);
@@ -740,16 +816,45 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         frame.render_widget(Paragraph::new(page), body);
     }
 
-    let typing = match (&app.finder, &app.input) {
-        (Some(finder), _) => Some(("find> ", &finder.line)),
-        (_, Some(line)) => Some((app.prompt(), line)),
+    if let Some(pane) = &mut app.pane {
+        let label = app
+            .compose
+            .as_ref()
+            .map_or(String::new(), |c| compose_title(&c.kind));
+        let rule = format!("─── {label} ");
+        let rest = width.saturating_sub(rule.width());
+        let line = Line::styled(format!("{rule}{}", "─".repeat(rest)), muted());
+        let editor = Rect::new(
+            input.x,
+            input.y + 1,
+            input.width,
+            input.height.saturating_sub(1),
+        );
+        frame.render_widget(Paragraph::new(line), Rect { height: 1, ..input });
+        pane.resize(editor.height, editor.width);
+        frame.render_widget(&*pane, editor);
+        if let Some((column, row)) = pane.cursor() {
+            frame.set_cursor_position(Position::new(editor.x + column, editor.y + row));
+        }
+    }
+    let typing = match (&app.compose, &app.finder, &app.input) {
+        _ if app.pane.is_some() => None,
+        (Some(compose), ..) => Some((compose_label(&compose.kind), "> ", &compose.line)),
+        (_, Some(finder), _) => Some((String::new(), "find> ", &finder.line)),
+        (.., Some(line)) => Some((String::new(), app.prompt(), line)),
         _ => None,
     };
-    if let Some((prompt, line)) = typing {
-        let shown = line.shown();
-        let before: String = shown.chars().take(line.cursor()).collect();
-        frame.render_widget(Paragraph::new(format!(" {prompt}{shown}")), input);
-        let x = input.x + u16::try_from(1 + prompt.width() + before.width()).unwrap_or(0);
+    if let Some((label, prompt, line)) = typing {
+        let lead = 1 + label.width() + prompt.width();
+        let (text, column) = visible(&line.shown(), line.cursor(), width.saturating_sub(lead));
+        let row = Line::from(vec![
+            Span::raw(" "),
+            Span::styled(label, muted()),
+            Span::raw(prompt),
+            Span::raw(text),
+        ]);
+        frame.render_widget(Paragraph::new(row), input);
+        let x = input.x + u16::try_from(lead + column).unwrap_or(0);
         frame.set_cursor_position(Position::new(
             x.min(input.right().saturating_sub(1)),
             input.y,
@@ -1018,5 +1123,28 @@ pub mod tests {
         let menu = from_end(&screen(&mut app, 80, 12), 1).to_owned();
         assert!(menu.contains("work:Engineer…#Town Square"), "{menu:?}");
         assert!(menu.ends_with("work:Engineering"), "{menu:?}");
+    }
+
+    #[test]
+    fn a_long_input_scrolls_so_the_cursor_stays_in_view() {
+        assert_eq!(visible("hello", 5, 20), ("hello".to_owned(), 5));
+        assert_eq!(visible("0123456789", 10, 5), ("6789".to_owned(), 4));
+        assert_eq!(visible("0123456789", 3, 5), ("01234".to_owned(), 3));
+        assert_eq!(visible("日本語日本語", 6, 5), ("本語".to_owned(), 4));
+    }
+
+    #[test]
+    fn insert_mode_shows_in_the_status_line_and_the_text_in_the_input_row() {
+        let mut app = fixture();
+        press(&mut app, "ihello");
+        let lines = screen(&mut app, 40, 12);
+        assert_eq!(from_end(&lines, 2), " > hello");
+        assert!(
+            from_end(&lines, 1).starts_with(" INSERT  work:"),
+            "{lines:?}"
+        );
+        press(&mut app, " and a much longer sentence that cannot fit");
+        let row = from_end(&screen(&mut app, 40, 12), 2).to_owned();
+        assert!(row.ends_with("cannot fit"), "{row:?}");
     }
 }

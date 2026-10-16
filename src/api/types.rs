@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 macro_rules! id {
     ($name:ident, $doc:literal) => {
         #[doc = $doc]
-        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
         pub struct $name(pub String);
     };
 }
@@ -106,7 +106,7 @@ pub struct Metadata {
 }
 
 /// A message. An empty `root_id` means it is not a reply.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct Post {
     pub id: PostId,
     pub create_at: i64,

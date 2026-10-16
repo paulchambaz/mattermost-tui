@@ -6,13 +6,17 @@ mod config;
 mod finder;
 mod input;
 mod model;
+mod term;
 mod ui;
 mod unread;
 mod ws;
 
 use anyhow::Result;
 use app::{App, Msg};
-use ratatui::crossterm::event::{self, Event, KeyEventKind};
+use ratatui::crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind,
+};
+use ratatui::crossterm::execute;
 use ratatui::DefaultTerminal;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 
@@ -29,12 +33,14 @@ async fn main() -> Result<()> {
     let (tx, rx) = unbounded_channel();
 
     let mut terminal = ratatui::init();
+    execute!(std::io::stdout(), EnableBracketedPaste)?;
     let keys = tx.clone();
     std::thread::spawn(move || {
         while let Ok(event) = event::read() {
             let msg = match event {
                 Event::Key(key) if key.kind == KeyEventKind::Press => Msg::Key(key),
                 Event::Resize(..) => Msg::Resize,
+                Event::Paste(text) => Msg::Paste(text),
                 _ => continue,
             };
             if keys.send(msg).is_err() {
@@ -44,6 +50,8 @@ async fn main() -> Result<()> {
     });
     let mut app = App::new(boot, path, tx);
     let result = run(&mut terminal, &mut app, rx).await;
+    drop(app);
+    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     ratatui::restore();
     result
 }
@@ -59,6 +67,9 @@ async fn run(
             break;
         };
         app.update(msg);
+        while let Ok(msg) = rx.try_recv() {
+            app.update(msg);
+        }
     }
     Ok(())
 }
