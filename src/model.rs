@@ -6,13 +6,20 @@ use std::sync::Arc;
 use chrono::{DateTime, Datelike, Local, TimeZone};
 
 use crate::api::types::{
-    CategoryList, Channel, ChannelId, ChannelKind, ChannelMember, Post, PostId, PostList,
+    CategoryList, Channel, ChannelId, ChannelKind, ChannelMember, Post, PostId, PostList, Reaction,
     Team as WireTeam, User, UserId,
 };
 use crate::api::Client;
 
 const GROUP_WINDOW_MS: i64 = 5 * 60 * 1000;
 const PALETTE: [u8; 12] = [1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 14];
+
+/// The users who reacted to a message with one emoji.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reactions {
+    pub name: String,
+    pub users: Vec<UserId>,
+}
 
 /// A post, ready to be shown.
 #[derive(Debug, Clone)]
@@ -26,10 +33,12 @@ pub struct Message {
     pub edited: bool,
     pub system: bool,
     pub files: Vec<String>,
+    pub reactions: Vec<Reactions>,
 }
 
 impl Message {
-    fn from_post(post: &Post) -> Self {
+    /// Reads a post as the server sent it.
+    pub fn from_post(post: &Post) -> Self {
         Self {
             id: post.id.clone(),
             at: Local
@@ -51,8 +60,77 @@ impl Message {
                 .flatten()
                 .map(|f| f.name.clone())
                 .collect(),
+            reactions: {
+                let mut groups = Vec::new();
+                for r in post.metadata.reactions.iter().flatten() {
+                    add_reaction(&mut groups, r);
+                }
+                groups
+            },
         }
     }
+}
+
+fn add_reaction(groups: &mut Vec<Reactions>, reaction: &Reaction) {
+    match groups.iter_mut().find(|g| g.name == reaction.emoji_name) {
+        Some(group) if group.users.contains(&reaction.user_id) => {}
+        Some(group) => group.users.push(reaction.user_id.clone()),
+        None => groups.push(Reactions {
+            name: reaction.emoji_name.clone(),
+            users: vec![reaction.user_id.clone()],
+        }),
+    }
+}
+
+/// Puts a message in its place by time, replacing the one with the same id.
+pub fn insert_message(list: &mut Vec<Message>, message: Message) {
+    match list.iter().position(|m| m.id == message.id) {
+        Some(i) => list[i] = message,
+        None => {
+            let at = list.partition_point(|m| m.ms <= message.ms);
+            list.insert(at, message);
+        }
+    }
+}
+
+/// Applies an edited post, keeping the reactions already known.
+pub fn edit_message(list: &mut [Message], post: &Post) {
+    if let Some(m) = list.iter_mut().find(|m| m.id == post.id) {
+        let reactions = std::mem::take(&mut m.reactions);
+        *m = Message {
+            reactions,
+            ..Message::from_post(post)
+        };
+    }
+}
+
+/// Removes a message and says where it was.
+pub fn remove_message(list: &mut Vec<Message>, id: &PostId) -> Option<usize> {
+    let i = list.iter().position(|m| &m.id == id)?;
+    list.remove(i);
+    Some(i)
+}
+
+/// Records a reaction on its message.
+pub fn react(list: &mut [Message], reaction: &Reaction) {
+    if let Some(m) = list.iter_mut().find(|m| m.id == reaction.post_id) {
+        add_reaction(&mut m.reactions, reaction);
+    }
+}
+
+/// Takes a reaction off its message; an emoji nobody uses disappears.
+pub fn unreact(list: &mut [Message], reaction: &Reaction) {
+    let Some(m) = list.iter_mut().find(|m| m.id == reaction.post_id) else {
+        return;
+    };
+    for group in m
+        .reactions
+        .iter_mut()
+        .filter(|g| g.name == reaction.emoji_name)
+    {
+        group.users.retain(|u| u != &reaction.user_id);
+    }
+    m.reactions.retain(|g| !g.users.is_empty());
 }
 
 /// Posts of a page oldest first, without the deleted ones.
@@ -113,18 +191,21 @@ pub struct Chan {
 }
 
 impl Chan {
-    /// Whether the tab should be marked: new posts, or a mention in a muted channel.
-    pub fn unread(&self) -> bool {
+    /// Whether the tab should be marked: posts newer than both the server's last view
+    /// and `seen`, or a mention in a muted channel.
+    pub fn unread(&self, seen: i64) -> bool {
         let Some(member) = &self.member else {
             return false;
         };
         let muted = member.notify_props.mark_unread == "mention";
-        self.mentions() || (!muted && self.info.last_post_at > member.last_viewed_at)
+        let newer = self.info.last_post_at > member.last_viewed_at.max(seen);
+        self.mentions(seen) || (!muted && newer)
     }
 
-    /// Whether someone mentioned the reader since the channel was last viewed.
-    pub fn mentions(&self) -> bool {
-        self.member.as_ref().is_some_and(|m| m.mention_count > 0)
+    /// Whether someone mentioned the reader in posts newer than `seen`.
+    pub fn mentions(&self, seen: i64) -> bool {
+        let counted = self.member.as_ref().is_some_and(|m| m.mention_count > 0);
+        counted && self.info.last_post_at > seen
     }
 
     /// Index of the first message newer than the last view, when it is not the first one.
@@ -196,6 +277,14 @@ pub fn order_channels(
         .collect()
 }
 
+/// The state of the event stream of a server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Link {
+    Connecting,
+    Up,
+    Down,
+}
+
 /// A logged-in server, or one that is still connecting.
 #[derive(Debug)]
 pub struct Server {
@@ -207,6 +296,9 @@ pub struct Server {
     pub teams: Vec<Team>,
     pub messages: HashMap<ChannelId, Vec<Message>>,
     pub loading: HashSet<ChannelId>,
+    pub seen: HashMap<ChannelId, i64>,
+    pub refreshed: HashSet<ChannelId>,
+    pub link: Link,
 }
 
 impl Server {
@@ -221,6 +313,9 @@ impl Server {
             teams: Vec::new(),
             messages: HashMap::new(),
             loading: HashSet::new(),
+            seen: HashMap::new(),
+            refreshed: HashSet::new(),
+            link: Link::Connecting,
         }
     }
 
@@ -246,6 +341,16 @@ impl Server {
                 None => "@…".into(),
             },
         }
+    }
+
+    /// Whether a tab is marked unread, counting what was read in this program.
+    pub fn unread(&self, chan: &Chan) -> bool {
+        chan.unread(self.seen.get(&chan.info.id).copied().unwrap_or(0))
+    }
+
+    /// Whether a tab is marked with a mention, counting what was read in this program.
+    pub fn mentioned(&self, chan: &Chan) -> bool {
+        chan.mentions(self.seen.get(&chan.info.id).copied().unwrap_or(0))
     }
 
     /// The other person of a direct channel, whose name is `id__id`.
@@ -284,6 +389,7 @@ mod tests {
             edited: false,
             system: false,
             files: Vec::new(),
+            reactions: Vec::new(),
         }
     }
 
@@ -363,11 +469,18 @@ mod tests {
 
     #[test]
     fn unread_follows_timestamps_and_mutes() {
-        assert!(chan(10, Some(member("c", 5, 0, "all"))).unread());
-        assert!(!chan(5, Some(member("c", 5, 0, "all"))).unread());
-        assert!(!chan(10, Some(member("c", 5, 0, "mention"))).unread());
-        assert!(chan(10, Some(member("c", 5, 2, "mention"))).unread());
-        assert!(!chan(10, None).unread());
+        assert!(chan(10, Some(member("c", 5, 0, "all"))).unread(0));
+        assert!(!chan(5, Some(member("c", 5, 0, "all"))).unread(0));
+        assert!(!chan(10, Some(member("c", 5, 0, "mention"))).unread(0));
+        assert!(chan(10, Some(member("c", 5, 2, "mention"))).unread(0));
+        assert!(!chan(10, None).unread(0));
+    }
+
+    #[test]
+    fn what_was_seen_here_is_not_unread_or_mentioned() {
+        let c = chan(10, Some(member("c", 5, 2, "all")));
+        assert!(c.unread(9) && c.mentions(9));
+        assert!(!c.unread(10) && !c.mentions(10));
     }
 
     #[test]
@@ -433,5 +546,38 @@ mod tests {
         let ids = [UserId("u2".into()), UserId("u2".into())];
         assert_eq!(server.unknown(ids.iter()).len(), 1);
         assert!(server.unknown(ids.iter()).is_empty());
+    }
+
+    fn reaction(user: &str, post: &str, name: &str) -> Reaction {
+        Reaction {
+            user_id: UserId(user.into()),
+            post_id: PostId(post.into()),
+            emoji_name: name.into(),
+        }
+    }
+
+    #[test]
+    fn messages_are_inserted_in_order_without_duplicates() {
+        let mut list = vec![msg("a", 10), msg("a", 30)];
+        insert_message(&mut list, msg("b", 20));
+        insert_message(&mut list, msg("b", 20));
+        assert_eq!(list.iter().map(|m| m.ms).collect::<Vec<_>>(), [10, 20, 30]);
+        assert_eq!(remove_message(&mut list, &PostId("p20".into())), Some(1));
+        assert_eq!(remove_message(&mut list, &PostId("p20".into())), None);
+    }
+
+    #[test]
+    fn reactions_group_by_emoji_and_vanish_when_empty() {
+        let mut list = vec![msg("a", 10)];
+        react(&mut list, &reaction("u1", "p10", "+1"));
+        react(&mut list, &reaction("u2", "p10", "+1"));
+        react(&mut list, &reaction("u2", "p10", "+1"));
+        react(&mut list, &reaction("u1", "p10", "tada"));
+        assert_eq!(list[0].reactions[0].users.len(), 2);
+        assert_eq!(list[0].reactions.len(), 2);
+        unreact(&mut list, &reaction("u1", "p10", "tada"));
+        unreact(&mut list, &reaction("u1", "p10", "+1"));
+        assert_eq!(list[0].reactions.len(), 1);
+        assert_eq!(list[0].reactions[0].users, [UserId("u2".into())]);
     }
 }

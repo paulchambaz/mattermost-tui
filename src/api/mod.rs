@@ -179,12 +179,8 @@ impl Client {
             }
         };
         let mut resp = send(build(self.token())).await?;
-        if resp.status() == StatusCode::UNAUTHORIZED {
-            if let Credentials::Password { login, password } = &self.credentials {
-                let token = login_token(&self.http, &self.base, login, password, None).await?;
-                *self.token.lock().unwrap_or_else(PoisonError::into_inner) = token.clone();
-                resp = send(build(token)).await?;
-            }
+        if resp.status() == StatusCode::UNAUTHORIZED && self.relogin().await? {
+            resp = send(build(self.token())).await?;
         }
         if resp.status().is_success() {
             return Ok(resp.json().await?);
@@ -192,7 +188,30 @@ impl Client {
         Err(status_error(resp).await)
     }
 
-    fn token(&self) -> String {
+    /// Logs in again after the session expired; false when there is no password to do it with.
+    ///
+    /// # Errors
+    /// Fails when the server refuses the login.
+    pub async fn relogin(&self) -> Result<bool, Error> {
+        let Credentials::Password { login, password } = &self.credentials else {
+            return Ok(false);
+        };
+        let token = login_token(&self.http, &self.base, login, password, None).await?;
+        *self.token.lock().unwrap_or_else(PoisonError::into_inner) = token;
+        Ok(true)
+    }
+
+    /// The address of the event stream.
+    pub fn ws_url(&self) -> String {
+        let (secure, rest) = match self.base.strip_prefix("https://") {
+            Some(rest) => (true, rest),
+            None => (false, self.base.trim_start_matches("http://")),
+        };
+        format!("{}://{rest}/websocket", if secure { "wss" } else { "ws" })
+    }
+
+    /// The current session token.
+    pub fn token(&self) -> String {
         self.token
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

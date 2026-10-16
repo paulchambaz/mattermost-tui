@@ -6,6 +6,7 @@ mod config;
 mod input;
 mod model;
 mod ui;
+mod ws;
 
 use anyhow::Result;
 use app::{App, Msg};

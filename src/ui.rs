@@ -9,7 +9,7 @@ use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::App;
-use crate::model::{self, group_with_previous, Chan, Message, Server};
+use crate::model::{self, group_with_previous, Chan, Link, Message, Server};
 
 const MARGIN: usize = 1;
 const TIME: usize = 5;
@@ -24,6 +24,7 @@ const BINDINGS: &[(&str, &str)] = &[
     ("H L", "previous / next team, across servers"),
     (":", "command line"),
     ("?", "this help"),
+    ("a", "reactions under the messages"),
     ("q", "quit"),
 ];
 
@@ -368,6 +369,30 @@ fn messages_log(
             }
             log.lines.push(Line::from(spans));
         }
+        if app.reactions && !message.reactions.is_empty() {
+            let mut spans = vec![Span::raw(indent.clone())];
+            for (n, group) in message.reactions.iter().enumerate() {
+                let mine = server
+                    .me
+                    .as_ref()
+                    .is_some_and(|m| group.users.contains(&m.id));
+                let style = if mine {
+                    Style::new().add_modifier(Modifier::BOLD)
+                } else {
+                    muted()
+                };
+                let sep = if n > 0 { "  " } else { "" };
+                spans.push(Span::styled(
+                    format!(
+                        "{sep}{} {}",
+                        emoji(&format!(":{}:", group.name)),
+                        group.users.len()
+                    ),
+                    style,
+                ));
+            }
+            log.lines.push(Line::from(spans));
+        }
         for file in &message.files {
             log.lines.push(Line::from(vec![
                 Span::raw(indent.clone()),
@@ -412,20 +437,26 @@ fn tabs_line(app: &App, width: usize) -> Line<'static> {
         return Line::from(vec![chip, Span::styled(" loading…", muted())]);
     };
 
+    let active = team.cur.min(chans.len() - 1);
+    let flagged = |i: usize| i != active && server.unread(&chans[i]);
     let labels: Vec<String> = chans
         .iter()
-        .map(|c| {
+        .enumerate()
+        .map(|(i, c)| {
             format!(
                 " {}{}{} ",
-                if c.unread() { "•" } else { "" },
+                if flagged(i) { "•" } else { "" },
                 server.label(c),
-                if c.mentions() { "!" } else { "" }
+                if i != active && server.mentioned(c) {
+                    "!"
+                } else {
+                    ""
+                }
             )
         })
         .collect();
     let widths: Vec<usize> = labels.iter().map(|l| l.width()).collect();
     let room = width.saturating_sub(chip.width() + 2).max(1);
-    let active = team.cur.min(chans.len() - 1);
     let first = first_visible(&widths, active, room);
 
     let mut spans = vec![chip, Span::raw(if first > 0 { "‹" } else { " " })];
@@ -435,7 +466,7 @@ fn tabs_line(app: &App, width: usize) -> Line<'static> {
         if used + widths[i] > room {
             break;
         }
-        let style = match (i == active, chans[i].unread()) {
+        let style = match (i == active, flagged(i)) {
             (true, _) => Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD),
             (_, true) => Style::new().add_modifier(Modifier::BOLD),
             _ => Style::new(),
@@ -473,9 +504,13 @@ fn status_line(app: &App, width: usize, percent: usize) -> Line<'static> {
             _ => String::new(),
         };
         let count = app.messages().map_or(0, <[Message]>::len);
+        let offline = if server_down(app) { "offline  " } else { "" };
         let right = match count {
-            0 => "? help ".to_owned(),
-            _ => format!("{}/{count}  {percent:>3}%  ? help ", app.cursor + 1),
+            0 => format!("{offline}? help "),
+            _ => format!(
+                "{offline}{}/{count}  {percent:>3}%  ? help ",
+                app.cursor + 1
+            ),
         };
         (format!(" {mode}  {place}"), right)
     } else {
@@ -487,6 +522,12 @@ fn status_line(app: &App, width: usize, percent: usize) -> Line<'static> {
         format!("{left}{}{right}", " ".repeat(gap)),
         Style::new().add_modifier(Modifier::REVERSED),
     )
+}
+
+fn server_down(app: &App) -> bool {
+    app.servers
+        .get(app.server)
+        .is_some_and(|s| s.link == Link::Down)
 }
 
 fn help_lines() -> Vec<Line<'static>> {
@@ -578,14 +619,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
     use super::*;
     use crate::app::tests::{fixture, press, press_code};
 
-    fn screen(app: &mut App, width: u16, height: u16) -> Vec<String> {
+    pub fn screen(app: &mut App, width: u16, height: u16) -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|frame| draw(frame, app)).unwrap();
         let buffer = terminal.backend().buffer();
@@ -593,11 +634,17 @@ mod tests {
             .content()
             .chunks(usize::from(width))
             .map(|row| {
-                row.iter()
-                    .map(|cell| cell.symbol())
-                    .collect::<String>()
-                    .trim_end()
-                    .to_owned()
+                let mut line = String::new();
+                let mut skip = 0;
+                for cell in row {
+                    if skip > 0 {
+                        skip -= 1;
+                        continue;
+                    }
+                    skip = cell.symbol().width().saturating_sub(1);
+                    line.push_str(cell.symbol());
+                }
+                line.trim_end().to_owned()
             })
             .collect()
     }

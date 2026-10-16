@@ -82,6 +82,14 @@ pub struct ChannelMember {
     pub notify_props: NotifyProps,
 }
 
+/// One user's reaction to a post.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Reaction {
+    pub user_id: UserId,
+    pub post_id: PostId,
+    pub emoji_name: String,
+}
+
 /// A file attached to a post.
 #[derive(Debug, Clone, Deserialize)]
 pub struct FileInfo {
@@ -91,6 +99,8 @@ pub struct FileInfo {
 /// Extra data the server sends along with a post.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Metadata {
+    #[serde(default)]
+    pub reactions: Option<Vec<Reaction>>,
     #[serde(default)]
     pub files: Option<Vec<FileInfo>>,
 }
@@ -105,6 +115,7 @@ pub struct Post {
     #[serde(default)]
     pub delete_at: i64,
     pub user_id: UserId,
+    pub channel_id: ChannelId,
     #[serde(default)]
     pub root_id: String,
     #[serde(default)]

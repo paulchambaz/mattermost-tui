@@ -14,7 +14,8 @@ use crate::api::types::{
 use crate::api::{Client, Error};
 use crate::config::{self, Credentials, ServerConfig};
 use crate::input::{self, Command, Line, Step, Wizard};
-use crate::model::{self, group_start, group_with_previous, Message, Server, Team};
+use crate::model::{self, group_start, group_with_previous, Link, Message, Server, Team};
+use crate::ws::{self, Event, Ws};
 
 const POSTS_PER_PAGE: u32 = 60;
 
@@ -25,6 +26,7 @@ pub enum Msg {
     Resize,
     Loaded(usize, Loaded),
     LoggedIn(Result<Box<Session>, Error>),
+    Ws(usize, Ws),
 }
 
 /// The answer to one request, tagged by the server it came from.
@@ -64,6 +66,7 @@ pub struct App {
     pub cursor: usize,
     pub browsing: bool,
     pub follow: bool,
+    pub reactions: bool,
     pub scroll: usize,
     pub notice: String,
     pub input: Option<Line>,
@@ -89,6 +92,7 @@ impl App {
             cursor: 0,
             browsing: false,
             follow: false,
+            reactions: false,
             scroll: usize::MAX,
             notice: String::new(),
             input: None,
@@ -117,6 +121,7 @@ impl App {
             Msg::Resize => {}
             Msg::Loaded(i, loaded) => self.loaded(i, loaded),
             Msg::LoggedIn(result) => self.logged_in(result),
+            Msg::Ws(i, ws) => self.ws(i, ws),
         }
     }
 
@@ -183,6 +188,7 @@ impl App {
             'k' => self.step_up(),
             'g' => self.move_cursor(0),
             'G' => self.move_cursor(usize::MAX),
+            'a' => self.reactions = !self.reactions,
             'w' => self.next_group(),
             'b' => self.previous_group(),
             'J' => self.move_channel(1),
@@ -293,6 +299,7 @@ impl App {
                 self.team = 0;
                 self.reset_view();
                 self.load_teams(self.server);
+                self.start_ws(self.server);
             }
             Err(Error::MfaRequired) => {
                 wizard.step = Step::Mfa;
@@ -389,7 +396,15 @@ impl App {
         self.ensure();
     }
 
+    fn current_id(&self, i: usize) -> Option<ChannelId> {
+        if i != self.server {
+            return None;
+        }
+        self.channel().map(|(_, chan)| chan.info.id.clone())
+    }
+
     fn loaded(&mut self, i: usize, loaded: Loaded) {
+        let current = self.current_id(i);
         let Some(server) = self.servers.get_mut(i) else {
             return;
         };
@@ -399,6 +414,7 @@ impl App {
                 server.users.insert(session.me.id.clone(), session.me);
                 server.client = Some(session.client);
                 self.load_teams(i);
+                self.start_ws(i);
             }
             Loaded::Connected(Err(e)) | Loaded::Failed(e) => {
                 self.notice = format!("{}: {e}", server.name);
@@ -427,6 +443,11 @@ impl App {
                     .collect();
                 let ids = server.unknown(others.iter());
                 if let Some(t) = server.teams.iter_mut().find(|t| t.info.id == team) {
+                    let kept = t.chans.as_ref().and_then(|c| c.get(t.cur));
+                    let kept = kept.map(|c| c.info.id.clone());
+                    t.cur = kept
+                        .and_then(|id| chans.iter().position(|c| c.info.id == id))
+                        .unwrap_or(0);
                     t.chans = Some(chans);
                     t.loading = false;
                 }
@@ -436,6 +457,14 @@ impl App {
                 let messages = model::messages_of(&list);
                 let ids = server.unknown(messages.iter().map(|m| &m.user));
                 server.loading.remove(&channel);
+                if current.as_ref() == Some(&channel) && self.browsing {
+                    let old = server
+                        .messages
+                        .get(&channel)
+                        .and_then(|m| m.get(self.cursor));
+                    let at = old.and_then(|o| messages.iter().position(|m| m.id == o.id));
+                    self.cursor = at.unwrap_or(self.cursor);
+                }
                 server.messages.insert(channel, messages);
                 self.fetch_users(i, ids);
             }
@@ -446,6 +475,7 @@ impl App {
             }
         }
         if i == self.server {
+            self.cursor = self.cursor.min(self.count().saturating_sub(1));
             if self.scroll == usize::MAX && !self.browsing {
                 self.reset_view();
             }
@@ -453,50 +483,246 @@ impl App {
         }
     }
 
-    fn ensure(&mut self) {
+    fn ws(&mut self, i: usize, ws: Ws) {
+        let Some(server) = self.servers.get_mut(i) else {
+            return;
+        };
+        match ws {
+            Ws::Up { resync } => {
+                server.link = Link::Up;
+                if resync {
+                    self.resync(i);
+                }
+            }
+            Ws::Down(reason) => {
+                server.link = Link::Down;
+                if self.notice.is_empty() {
+                    self.notice = format!("{}: {reason}", server.name);
+                }
+            }
+            Ws::Event(event) => self.apply_event(i, *event),
+        }
+    }
+
+    fn resync(&mut self, i: usize) {
+        let current = self.current_id(i);
+        let Some(server) = self.servers.get_mut(i) else {
+            return;
+        };
+        server.messages.retain(|id, _| Some(id) == current.as_ref());
+        self.refresh_channels(i);
+        if let Some(id) = current {
+            self.fetch_posts(i, id);
+        }
+    }
+
+    fn refresh_channels(&self, i: usize) {
+        let Some(server) = self.servers.get(i) else {
+            return;
+        };
+        let loaded = server.teams.iter().filter(|t| t.chans.is_some());
+        for team in loaded {
+            self.fetch_channels(i, team.info.id.clone());
+        }
+    }
+
+    fn apply_event(&mut self, i: usize, event: Event) {
+        let current = self.current_id(i);
+        let before = self.count();
+        let at_end = !self.browsing || self.cursor + 1 >= before;
+        let Some(server) = self.servers.get_mut(i) else {
+            return;
+        };
+        let me = server.me.as_ref().map(|m| m.id.clone());
+        let (mut touched, mut removed, mut refresh) = (None, None, false);
+        let mut ids = Vec::new();
+        match event {
+            Event::Posted { post, mentions } => {
+                let channel = post.channel_id.clone();
+                let mine = me.as_ref() == Some(&post.user_id);
+                let mentioned = !mine && me.as_ref().is_some_and(|m| mentions.contains(m));
+                let mut known = false;
+                let chans = server
+                    .teams
+                    .iter_mut()
+                    .flat_map(|t| t.chans.iter_mut().flatten());
+                for chan in chans.filter(|c| c.info.id == channel) {
+                    known = true;
+                    chan.info.last_post_at = chan.info.last_post_at.max(post.create_at);
+                    if let (true, Some(member)) = (mentioned, chan.member.as_mut()) {
+                        member.mention_count += 1;
+                    }
+                }
+                if mine {
+                    let seen = server.seen.entry(channel.clone()).or_insert(0);
+                    *seen = (*seen).max(post.create_at);
+                }
+                refresh = !known && server.refreshed.insert(channel.clone());
+                ids = server.unknown(std::iter::once(&post.user_id));
+                if let Some(list) = server.messages.get_mut(&channel) {
+                    model::insert_message(list, Message::from_post(&post));
+                }
+                touched = Some(channel);
+            }
+            Event::Edited(post) => {
+                if let Some(list) = server.messages.get_mut(&post.channel_id) {
+                    model::edit_message(list, &post);
+                }
+            }
+            Event::Deleted(post) => {
+                if let Some(list) = server.messages.get_mut(&post.channel_id) {
+                    removed = model::remove_message(list, &post.id);
+                }
+                touched = Some(post.channel_id);
+            }
+            Event::ReactionAdded(reaction) => {
+                server
+                    .messages
+                    .values_mut()
+                    .for_each(|l| model::react(l, &reaction));
+            }
+            Event::ReactionRemoved(reaction) => {
+                server
+                    .messages
+                    .values_mut()
+                    .for_each(|l| model::unreact(l, &reaction));
+            }
+            Event::Viewed(channel) => {
+                let chans = server
+                    .teams
+                    .iter_mut()
+                    .flat_map(|t| t.chans.iter_mut().flatten());
+                for model::Chan { info, member } in chans.filter(|c| c.info.id == channel) {
+                    if let Some(member) = member {
+                        member.last_viewed_at = member.last_viewed_at.max(info.last_post_at);
+                        member.mention_count = 0;
+                    }
+                }
+            }
+        }
+        if refresh {
+            self.refresh_channels(i);
+        }
+        self.fetch_users(i, ids);
+        if touched.is_some() && touched == current {
+            let after = self.count();
+            match removed {
+                Some(at) => {
+                    self.cursor = self.cursor.saturating_sub(usize::from(at < self.cursor));
+                    self.cursor = self.cursor.min(after.saturating_sub(1));
+                }
+                None if after > before && at_end => {
+                    self.cursor = after - 1;
+                    match self.browsing {
+                        true => self.follow = true,
+                        false => self.scroll = usize::MAX,
+                    }
+                }
+                None => {}
+            }
+        }
+        if i == self.server {
+            self.ensure();
+        }
+    }
+
+    fn mark_seen(&mut self) {
         let Some(server) = self.servers.get_mut(self.server) else {
+            return;
+        };
+        let chan = server
+            .teams
+            .get(self.team)
+            .and_then(|t| t.chans.as_ref()?.get(t.cur));
+        let Some((id, last_post)) = chan.map(|c| (c.info.id.clone(), c.info.last_post_at)) else {
+            return;
+        };
+        let Some(newest) = server
+            .messages
+            .get(&id)
+            .map(|m| m.last().map_or(0, |m| m.ms))
+        else {
+            return;
+        };
+        let seen = server.seen.entry(id).or_insert(0);
+        *seen = (*seen).max(last_post.max(newest));
+    }
+
+    fn ensure(&mut self) {
+        self.mark_seen();
+        let (i, t) = (self.server, self.team);
+        let Some(server) = self.servers.get_mut(i) else {
+            return;
+        };
+        if server.client.is_none() {
+            return;
+        }
+        let Some(team) = server.teams.get_mut(t) else {
+            return;
+        };
+        if team.chans.is_none() {
+            if !team.loading {
+                team.loading = true;
+                let id = team.info.id.clone();
+                self.fetch_channels(i, id);
+            }
+            return;
+        }
+        let chan = team.chans.as_ref().and_then(|c| c.get(team.cur));
+        let Some(id) = chan.map(|c| c.info.id.clone()) else {
+            return;
+        };
+        if !server.messages.contains_key(&id) {
+            self.fetch_posts(i, id);
+        }
+    }
+
+    fn fetch_channels(&self, i: usize, team: TeamId) {
+        let Some(client) = self.servers.get(i).and_then(|s| s.client.clone()) else {
+            return;
+        };
+        self.spawn(i, async move {
+            let channels = client.channels(&team).await;
+            let members = client.members(&team).await;
+            let categories = client.categories(&team).await.ok();
+            match (channels, members) {
+                (Ok(channels), Ok(members)) => Loaded::Channels {
+                    team,
+                    channels,
+                    members,
+                    categories,
+                },
+                (Err(e), _) | (_, Err(e)) => Loaded::Failed(e.to_string()),
+            }
+        });
+    }
+
+    fn fetch_posts(&mut self, i: usize, id: ChannelId) {
+        let Some(server) = self.servers.get_mut(i) else {
             return;
         };
         let Some(client) = server.client.clone() else {
             return;
         };
-        let Some(team) = server.teams.get_mut(self.team) else {
-            return;
-        };
-        let id = match &team.chans {
-            None if !team.loading => {
-                team.loading = true;
-                let team = team.info.id.clone();
-                return self.spawn(self.server, async move {
-                    let channels = client.channels(&team).await;
-                    let members = client.members(&team).await;
-                    let categories = client.categories(&team).await.ok();
-                    match (channels, members) {
-                        (Ok(channels), Ok(members)) => Loaded::Channels {
-                            team,
-                            channels,
-                            members,
-                            categories,
-                        },
-                        (Err(e), _) | (_, Err(e)) => Loaded::Failed(e.to_string()),
-                    }
-                });
-            }
-            None => return,
-            Some(chans) => match chans.get(team.cur) {
-                Some(chan) => chan.info.id.clone(),
-                None => return,
-            },
-        };
-        if server.messages.contains_key(&id) || !server.loading.insert(id.clone()) {
+        if !server.loading.insert(id.clone()) {
             return;
         }
-        self.spawn(self.server, async move {
+        self.spawn(i, async move {
             match client.posts(&id, None, POSTS_PER_PAGE).await {
                 Ok(list) => Loaded::Posts { channel: id, list },
                 Err(e) => Loaded::Failed(e.to_string()),
             }
         });
+    }
+
+    fn start_ws(&self, i: usize) {
+        let Some(client) = self.servers.get(i).and_then(|s| s.client.clone()) else {
+            return;
+        };
+        let tx = self.tx.clone();
+        tokio::spawn(ws::run(client, ws::BACKOFF, move |event| {
+            tx.send(Msg::Ws(i, event)).is_ok()
+        }));
     }
 
     fn connect(&self, i: usize, url: &str, credentials: Credentials) {
@@ -560,7 +786,8 @@ pub mod tests {
     use tokio::sync::mpsc::unbounded_channel;
 
     use super::*;
-    use crate::api::types::PostList;
+    use crate::api::types::{Post, PostList, Reaction};
+    use crate::ui::tests::screen;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent {
@@ -772,5 +999,145 @@ pub mod tests {
         assert!(app.notice.contains("Wrong password."));
         assert_eq!(app.prompt(), "Password: ");
         assert!(app.servers.is_empty());
+    }
+
+    fn post(id: &str, channel: &str, user: &str, text: &str, ms: i64) -> Post {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "create_at": ms, "user_id": user, "channel_id": channel, "message": text
+        }))
+        .unwrap()
+    }
+
+    fn posted(app: &mut App, post: Post, mentions: &[&str]) {
+        let mentions = mentions.iter().map(|m| UserId((*m).into())).collect();
+        app.apply_event(0, Event::Posted { post, mentions });
+    }
+
+    fn reaction(user: &str, post: &str) -> Reaction {
+        serde_json::from_value(serde_json::json!({
+            "user_id": user, "post_id": post, "emoji_name": "tada"
+        }))
+        .unwrap()
+    }
+
+    fn text(app: &mut App) -> String {
+        screen(app, 80, 14).join("\n")
+    }
+
+    fn tabs(app: &mut App) -> String {
+        screen(app, 80, 14).remove(0)
+    }
+
+    #[test]
+    fn a_new_post_in_the_current_channel_appears_and_the_view_follows() {
+        let mut app = fixture();
+        posted(
+            &mut app,
+            post("p10", "c3", "u2", "late news", 1_700_000_300_000),
+            &[],
+        );
+        assert!(text(&mut app).contains("late news"));
+        assert_eq!((app.cursor, app.browsing), (2, false));
+        press(&mut app, "kk");
+        assert_eq!(app.cursor, 1);
+        posted(
+            &mut app,
+            post("p11", "c3", "u2", "later news", 1_700_000_400_000),
+            &[],
+        );
+        assert_eq!(app.cursor, 1);
+    }
+
+    #[test]
+    fn a_post_elsewhere_counts_a_mention_and_viewing_clears_the_tab() {
+        let mut app = fixture();
+        assert!(tabs(&mut app).contains("•#Town Square!"));
+        posted(
+            &mut app,
+            post("p12", "c1", "u2", "@paul ping", 1_700_000_500_000),
+            &["u1"],
+        );
+        let member = app.servers[0].teams[0].chans.as_ref().unwrap()[1]
+            .member
+            .clone()
+            .unwrap();
+        assert_eq!(member.mention_count, 2);
+        app.apply_event(0, Event::Viewed(ChannelId("c1".into())));
+        assert!(tabs(&mut app).contains(" #Town Square "));
+    }
+
+    #[test]
+    fn my_own_post_from_another_device_is_not_unread() {
+        let mut app = fixture();
+        app.servers[0].teams[0].chans.as_mut().unwrap()[1].member = None;
+        posted(
+            &mut app,
+            post("p13", "c1", "u1", "from my phone", 1_700_000_600_000),
+            &[],
+        );
+        assert!(!tabs(&mut app).contains("•"));
+    }
+
+    #[test]
+    fn what_was_read_here_stays_read_after_a_refresh() {
+        let mut app = fixture();
+        press(&mut app, "J");
+        let list: PostList = json("posts");
+        app.loaded(
+            0,
+            Loaded::Posts {
+                channel: ChannelId("c1".into()),
+                list,
+            },
+        );
+        assert!(tabs(&mut app).contains(" #Town Square "));
+        press(&mut app, "K");
+        app.loaded(
+            0,
+            Loaded::Channels {
+                team: TeamId("t1".into()),
+                channels: json("channels"),
+                members: json("members"),
+                categories: Some(json("categories")),
+            },
+        );
+        assert!(tabs(&mut app).contains(" #Town Square "));
+        assert_eq!(app.servers[0].teams[0].cur, 0);
+    }
+
+    #[test]
+    fn edits_deletes_and_reactions_change_the_screen() {
+        let mut app = fixture();
+        press(&mut app, "a");
+        let mut edited = post("p2", "c3", "u2", "hi there", 1_700_000_060_000);
+        edited.edit_at = 1_700_000_070_000;
+        app.apply_event(0, Event::Edited(edited));
+        let shown = text(&mut app);
+        assert!(shown.contains("hi there *"), "{shown}");
+        app.apply_event(0, Event::ReactionAdded(reaction("u1", "p2")));
+        assert!(text(&mut app).contains("🎉 1"));
+        app.apply_event(0, Event::ReactionRemoved(reaction("u1", "p2")));
+        assert!(!text(&mut app).contains("🎉 1"));
+        press(&mut app, "kk");
+        app.apply_event(
+            0,
+            Event::Deleted(post("p1", "c3", "u1", "", 1_700_000_000_000)),
+        );
+        assert!(!text(&mut app).contains("hello"));
+        assert_eq!(app.cursor, 0);
+    }
+
+    #[test]
+    fn a_dropped_stream_shows_offline_until_it_is_back() {
+        let mut app = fixture();
+        app.ws(0, Ws::Down("connection closed".into()));
+        assert_eq!(app.notice, "work: connection closed");
+        app.notice.clear();
+        assert!(screen(&mut app, 80, 14)
+            .last()
+            .unwrap()
+            .ends_with("offline  2/2  100%  ? help"));
+        app.ws(0, Ws::Up { resync: false });
+        assert!(!screen(&mut app, 80, 14).last().unwrap().contains("offline"));
     }
 }
