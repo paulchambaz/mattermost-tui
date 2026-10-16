@@ -261,6 +261,16 @@ impl Client {
             .await
     }
 
+    /// The content of an attached file.
+    ///
+    /// # Errors
+    /// Fails on network or server errors.
+    pub async fn download(&self, file: &str) -> Result<Vec<u8>, Error> {
+        let path = format!("/files/{file}");
+        let resp = self.answer(Method::GET, &path, &[], None::<&()>).await?;
+        Ok(resp.bytes().await?.to_vec())
+    }
+
     /// Any read-only answer as it came, for the trace asked for with `MM_DEBUG`.
     ///
     /// # Errors
@@ -302,6 +312,16 @@ impl Client {
         query: &[(&str, String)],
         body: Option<&(impl Serialize + ?Sized)>,
     ) -> Result<T, Error> {
+        Ok(self.answer(method, path, query, body).await?.json().await?)
+    }
+
+    async fn answer(
+        &self,
+        method: Method,
+        path: &str,
+        query: &[(&str, String)],
+        body: Option<&(impl Serialize + ?Sized)>,
+    ) -> Result<Response, Error> {
         let url = format!("{}{path}", self.base);
         let build = |token: String| {
             let req = self
@@ -319,7 +339,7 @@ impl Client {
             resp = send(build(self.token())).await?;
         }
         if resp.status().is_success() {
-            return Ok(resp.json().await?);
+            return Ok(resp);
         }
         Err(status_error(resp).await)
     }
@@ -703,5 +723,21 @@ mod tests {
             .unwrap();
         let users = client.users(&[UserId("u2".into())]).await.unwrap();
         assert_eq!(users[0].username, "ana");
+    }
+
+    #[tokio::test]
+    async fn a_file_comes_down_as_bytes() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v4/files/f1"))
+            .and(header("authorization", "Bearer t"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8, 159, 146, 150]))
+            .mount(&server)
+            .await;
+        let client = Client::connect(&server.uri(), Credentials::Token("t".into()), None)
+            .await
+            .unwrap();
+        assert_eq!(client.download("f1").await.unwrap(), [0, 159, 146, 150]);
+        assert!(client.download("missing").await.is_err());
     }
 }

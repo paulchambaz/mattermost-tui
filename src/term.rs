@@ -76,6 +76,8 @@ pub struct Pane {
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
     file: PathBuf,
+    owned: bool,
+    title: String,
     size: (u16, u16),
 }
 
@@ -112,6 +114,34 @@ impl Pane {
             let _ = fs::remove_file(&file);
         }
         started
+    }
+
+    /// Runs a viewer on a file that already exists and is left alone afterwards.
+    ///
+    /// # Errors
+    /// Fails when the pseudo-terminal cannot be made or the program cannot start.
+    pub fn view(
+        command: &str,
+        file: &std::path::Path,
+        title: &str,
+        rows: u16,
+        cols: u16,
+        wake: impl Fn(bool) + Send + 'static,
+    ) -> Result<Self> {
+        let mut pane = Self::start(command, &file.to_path_buf(), rows, cols, wake)?;
+        pane.owned = false;
+        pane.title = title.to_owned();
+        Ok(pane)
+    }
+
+    /// Whether the pane shows a file instead of editing a message.
+    pub fn is_viewer(&self) -> bool {
+        !self.owned
+    }
+
+    /// What the pane shows, for a viewer.
+    pub fn title(&self) -> &str {
+        &self.title
     }
 
     fn start(
@@ -178,6 +208,8 @@ impl Pane {
             master: pair.master,
             child,
             file: file.clone(),
+            owned: true,
+            title: String::new(),
             size: (rows, cols),
         })
     }
@@ -235,7 +267,9 @@ impl Pane {
     pub fn finish(mut self) -> Result<String> {
         let status = self.child.wait()?;
         let content = fs::read_to_string(&self.file);
-        let _ = fs::remove_file(&self.file);
+        if self.owned {
+            let _ = fs::remove_file(&self.file);
+        }
         if !status.success() {
             bail!("the editor exited: {status}");
         }
@@ -247,7 +281,9 @@ impl Drop for Pane {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = fs::remove_file(&self.file);
+        if self.owned {
+            let _ = fs::remove_file(&self.file);
+        }
     }
 }
 
@@ -437,7 +473,7 @@ mod tests {
         let path = dir.path().join("editor.sh");
         fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-        path.to_string_lossy().into_owned()
+        format!("sh {}", path.display())
     }
 
     fn run(body: &str, text: &str) -> (Pane, Receiver<bool>, tempfile::TempDir) {
@@ -567,5 +603,23 @@ mod tests {
             reply_to("\\033]10;?\\033\\\\", 25),
             b"\x1b]10;rgb:c0c0/c0c0/c0c0\x1b\\"
         );
+    }
+
+    #[test]
+    fn a_viewer_shows_a_file_and_leaves_it_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("note.txt");
+        fs::write(&file, "kept").unwrap();
+        let editor = script(&dir, "cat \"$1\"");
+        let (tx, rx) = channel();
+        let pane = Pane::view(&editor, &file, "note.txt", 6, 30, move |done| {
+            let _ = tx.send(done);
+        })
+        .unwrap();
+        assert!(pane.is_viewer() && pane.title() == "note.txt");
+        until_done(&rx);
+        assert_eq!(contents(&pane), "kept");
+        drop(pane);
+        assert_eq!(fs::read_to_string(&file).unwrap(), "kept");
     }
 }

@@ -15,11 +15,14 @@ use crate::api::types::{
 };
 use crate::api::{Client, Error};
 use crate::clipboard;
-use crate::config::{self, Credentials, ServerConfig};
+use crate::config::{self, Credentials, ServerConfig, Settings};
 use crate::debug;
 use crate::finder;
 use crate::input::{self, Command, Line, Step, Wizard};
-use crate::model::{self, group_start, group_with_previous, Link, Message, Server, Team};
+use crate::model::{
+    self, group_start, group_with_previous, Attachment, Link, Message, Server, Team,
+};
+use crate::open::{self, Files, Kind as FileKind};
 use crate::term::{self, Pane};
 use crate::unread;
 use crate::ws::{self, Action, Event, Ws};
@@ -33,6 +36,7 @@ pub enum Msg {
     LoggedIn(Result<Box<Session>, Error>),
     Ws(usize, Ws),
     Paste(String),
+    Notice(String),
     Tick,
     Pty,
     EditorDone,
@@ -60,6 +64,11 @@ pub enum Loaded {
         asked: usize,
     },
     Users(Vec<User>),
+    Downloaded {
+        path: std::path::PathBuf,
+        name: String,
+        kind: FileKind,
+    },
     Members {
         channel: ChannelId,
         users: Vec<User>,
@@ -80,6 +89,13 @@ pub enum Loaded {
     },
     Viewed,
     Failed(String),
+}
+
+/// Something `o` can open: a link or an attachment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Item {
+    Link(String),
+    File(Attachment),
 }
 
 /// The reactions of the picker, chosen with the keys 1 to 9.
@@ -200,7 +216,9 @@ pub struct App {
     pub compose: Option<Compose>,
     pub pane: Option<Pane>,
     pub size: (u16, u16),
-    editor_cmd: String,
+    pub settings: Settings,
+    files: Files,
+    pub opener: Option<Vec<Item>>,
     editor_fresh: bool,
     awaiting: Option<Awaiting>,
     drafts: HashMap<(usize, ChannelId), String>,
@@ -244,10 +262,9 @@ impl App {
             compose: None,
             pane: None,
             size: (80, 24),
-            editor_cmd: std::env::var("EDITOR")
-                .ok()
-                .filter(|e| !e.is_empty())
-                .unwrap_or_else(|| "vi".into()),
+            settings: Settings::default(),
+            files: Files::new(),
+            opener: None,
             editor_fresh: false,
             awaiting: None,
             drafts: HashMap::new(),
@@ -279,6 +296,7 @@ impl App {
             Msg::LoggedIn(result) => self.logged_in(result),
             Msg::Ws(i, ws) => self.ws(i, ws),
             Msg::Paste(text) => self.paste(&text),
+            Msg::Notice(text) => self.notice = text,
             Msg::Tick | Msg::Pty => {}
             Msg::EditorDone => self.editor_done(),
         }
@@ -286,8 +304,8 @@ impl App {
 
     /// Name of the current mode, written on the status line.
     pub fn mode(&self) -> &'static str {
-        if self.pane.is_some() {
-            return "EDITOR";
+        if let Some(pane) = &self.pane {
+            return if pane.is_viewer() { "VIEWER" } else { "EDITOR" };
         }
         if self.compose.is_some() {
             return "INSERT";
@@ -298,6 +316,7 @@ impl App {
             (.., Some(_)) => "SEARCH",
             (_, _, Some(_), _) => "HELP",
             _ if self.picker => "REACT",
+            _ if self.opener.is_some() => "OPEN",
             _ if self.users.focus => "USERS",
             _ if self.selecting => "VISUAL",
             _ => "NORMAL",
@@ -350,6 +369,8 @@ impl App {
             self.open_editor();
         } else if self.picker {
             self.picker_key(key);
+        } else if self.opener.is_some() {
+            self.opener_key(key);
         } else if self.compose.is_some() {
             self.compose_key(key);
         } else if self.finder.is_some() {
@@ -393,6 +414,7 @@ impl App {
             'n' => self.next_unread(),
             'N' => self.next_mention(),
             'c' => self.mark_read(),
+            'o' => self.open_selected(),
             'x' => self.open_picker(),
             'X' => self.repeat_reaction(),
             'y' => self.yank(false),
@@ -546,13 +568,10 @@ impl App {
         let wake = move |done| {
             let _ = tx.send(if done { Msg::EditorDone } else { Msg::Pty });
         };
-        match Pane::spawn(
-            &self.editor_cmd,
-            &compose.line.text(),
-            rows,
-            self.size.0,
-            wake,
-        ) {
+        let editor = self
+            .settings
+            .editor(std::env::var("EDITOR").ok().as_deref());
+        match Pane::spawn(&editor, &compose.line.text(), rows, self.size.0, wake) {
             Ok(pane) => self.pane = Some(pane),
             Err(e) => {
                 self.notice = format!("Editor: {e}");
@@ -564,7 +583,10 @@ impl App {
     }
 
     fn editor_done(&mut self) {
-        if let Some(pane) = self.pane.take() {
+        let Some(pane) = self.pane.take() else {
+            return;
+        };
+        if !pane.is_viewer() {
             self.finished(pane.finish().map_err(|e| e.to_string()));
         }
     }
@@ -760,12 +782,31 @@ impl App {
         let count = lines.len();
         self.register = lines.join("\n");
         self.clipboard.push(clipboard::osc52(&self.register));
+        self.copy_to_system();
         self.selecting = false;
         self.browsing = true;
         self.notice = match count {
             1 => "Copied 1 message".into(),
             n => format!("Copied {n} messages"),
         };
+    }
+
+    fn copy_to_system(&mut self) {
+        let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+        let x11 = std::env::var_os("DISPLAY").is_some();
+        let setting = self.settings.copy.as_deref();
+        let Some(command) = clipboard::tool(setting, wayland, x11, clipboard::on_path) else {
+            return;
+        };
+        let tx = self.tx.clone();
+        let done = move |outcome: Option<String>| {
+            if let Some(why) = outcome {
+                let _ = tx.send(Msg::Notice(format!("Copy failed: {why}")));
+            }
+        };
+        if let Err(e) = clipboard::copy(&command, &self.register, done) {
+            self.notice = format!("Copy failed: {e}");
+        }
     }
 
     fn paste_register(&mut self) {
@@ -779,6 +820,112 @@ impl App {
         if let Some(compose) = &mut self.compose {
             compose.line.insert_str(&self.register);
             self.ping_typing();
+        }
+    }
+
+    fn open_selected(&mut self) {
+        let Some(message) = self.messages().and_then(|m| m.get(self.cursor)) else {
+            return;
+        };
+        let mut items: Vec<Item> = open::links(&message.text)
+            .into_iter()
+            .map(Item::Link)
+            .collect();
+        items.extend(message.files.iter().cloned().map(Item::File));
+        self.browsing = true;
+        match items.len() {
+            0 => self.notice = "Nothing to open".into(),
+            1 => self.open_item(items.remove(0)),
+            _ => self.opener = Some(items),
+        }
+    }
+
+    fn opener_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char(c @ '1'..='9') => {
+                let index = usize::from(c as u8 - b'1');
+                if let Some(item) = self
+                    .opener
+                    .as_ref()
+                    .and_then(|items| items.get(index))
+                    .cloned()
+                {
+                    self.opener = None;
+                    self.open_item(item);
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('o' | 'q') => self.opener = None,
+            _ => {}
+        }
+    }
+
+    fn open_item(&mut self, item: Item) {
+        match item {
+            Item::Link(url) => self.start_program(&self.settings.open.browser.clone(), &url, &url),
+            Item::File(file) => {
+                let Some(client) = self.servers.get(self.server).and_then(|s| s.client.clone())
+                else {
+                    self.notice = "Not connected".into();
+                    return;
+                };
+                self.notice = format!(
+                    "Downloading {} ({})…",
+                    file.name,
+                    open::human_size(file.size)
+                );
+                let base = self.files.base().to_owned();
+                let kind = open::kind(&file.mime, &file.name);
+                self.spawn(self.server, async move {
+                    let bytes = client.download(&file.id).await.map_err(|e| e.to_string());
+                    let saved = bytes.and_then(|b| {
+                        open::save(&base, &file.id, &file.name, &b).map_err(|e| e.to_string())
+                    });
+                    match saved {
+                        Ok(path) => Loaded::Downloaded {
+                            path,
+                            name: file.name,
+                            kind,
+                        },
+                        Err(e) => Loaded::Failed(e),
+                    }
+                });
+            }
+        }
+    }
+
+    fn start_program(&mut self, command: &str, target: &str, name: &str) {
+        let tx = self.tx.clone();
+        let done = move |outcome: Option<String>| {
+            if let Some(why) = outcome {
+                let _ = tx.send(Msg::Notice(why));
+            }
+        };
+        match open::start(command, target, done) {
+            Ok(()) => self.notice = format!("Opened {name}"),
+            Err(e) => self.notice = format!("{command}: {e}"),
+        }
+    }
+
+    fn downloaded(&mut self, path: &std::path::Path, name: &str, kind: FileKind) {
+        let open = &self.settings.open;
+        let command = match kind {
+            FileKind::Image => open.image.clone(),
+            FileKind::Video => open.video.clone(),
+            FileKind::Text => open.text.clone(),
+            FileKind::Other => open.other.clone(),
+        };
+        let target = path.to_string_lossy().into_owned();
+        if kind != FileKind::Text {
+            return self.start_program(&command, &target, name);
+        }
+        let (_, rows) = term::split(self.size.1);
+        let tx = self.tx.clone();
+        let wake = move |done| {
+            let _ = tx.send(if done { Msg::EditorDone } else { Msg::Pty });
+        };
+        match Pane::view(&command, path, name, rows, self.size.0, wake) {
+            Ok(pane) => self.pane = Some(pane),
+            Err(e) => self.notice = format!("{command}: {e}"),
         }
     }
 
@@ -1236,13 +1383,15 @@ impl App {
             }
             Loaded::Edited(post) => return self.apply_event(i, Event::Edited(post)),
             Loaded::Reacted(reaction) => {
-                let glyph = crate::ui::emoji(&format!(":{}:", reaction.emoji_name));
+                let glyph = crate::markdown::emoji(&format!(":{}:", reaction.emoji_name));
                 self.notice = format!("Reacted {glyph}");
+                self.reactions = true;
                 return self.apply_event(i, Event::ReactionAdded(reaction));
             }
             Loaded::Unreacted(reaction) => {
-                let glyph = crate::ui::emoji(&format!(":{}:", reaction.emoji_name));
+                let glyph = crate::markdown::emoji(&format!(":{}:", reaction.emoji_name));
                 self.notice = format!("Removed {glyph}");
+                self.reactions = true;
                 return self.apply_event(i, Event::ReactionRemoved(reaction));
             }
             Loaded::Deleted { channel, id } => {
@@ -1414,6 +1563,9 @@ impl App {
             | Loaded::Deleted { .. }
             | Loaded::NotSent { .. }
             | Loaded::Viewed => {}
+            Loaded::Downloaded { path, name, kind } => {
+                self.downloaded(&path, &name, kind);
+            }
             Loaded::Members {
                 channel,
                 users,
@@ -2000,6 +2152,14 @@ pub mod tests {
             tx,
         );
         app.notice.clear();
+        app.settings.copy = Some("true".into());
+        app.settings.open = crate::config::Open {
+            image: "true".into(),
+            video: "true".into(),
+            browser: "true".into(),
+            text: "true".into(),
+            other: "true".into(),
+        };
         app.servers[0].me = Some(json_user("u1", "paul"));
         app.loaded(
             0,
@@ -2175,14 +2335,14 @@ pub mod tests {
         assert!(app.servers.is_empty());
     }
 
-    fn post(id: &str, channel: &str, user: &str, text: &str, ms: i64) -> Post {
+    pub fn post(id: &str, channel: &str, user: &str, text: &str, ms: i64) -> Post {
         serde_json::from_value(serde_json::json!({
             "id": id, "create_at": ms, "user_id": user, "channel_id": channel, "message": text
         }))
         .unwrap()
     }
 
-    fn posted(app: &mut App, post: Post, mentions: &[&str]) {
+    pub fn posted(app: &mut App, post: Post, mentions: &[&str]) {
         let mentions = mentions.iter().map(|m| UserId((*m).into())).collect();
         app.apply_event(0, Event::Posted { post, mentions });
     }
@@ -2448,7 +2608,7 @@ pub mod tests {
     #[tokio::test]
     async fn a_whole_session_only_reads_and_views() {
         let (mut app, server) = live().await;
-        press(&mut app, "JnNcKjkgGwb?qkkggmjjm");
+        press(&mut app, "JnNcKjkgGwb?qkkggmjjmo");
         posted(
             &mut app,
             post("p40", "c1", "u2", "@paul hi", 1_700_000_900_000),
@@ -3158,7 +3318,7 @@ pub mod tests {
         let path = dir.path().join("editor.sh");
         std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        app.editor_cmd = path.to_string_lossy().into_owned();
+        app.settings.editor = Some(format!("sh {}", path.display()));
         dir
     }
 
@@ -3170,7 +3330,7 @@ pub mod tests {
             }
             std::thread::sleep(Duration::from_millis(30));
         }
-        panic!("{wanted:?} never appeared");
+        panic!("{wanted:?} never appeared: {:?}", screen(app, 60, 16));
     }
 
     #[test]
@@ -3525,5 +3685,210 @@ pub mod tests {
         assert!(requests
             .iter()
             .any(|(m, p, b)| m == "POST" && p == "/api/v4/users/status/ids" && b.contains("u2")));
+    }
+
+    fn program(dir: &tempfile::TempDir, name: &str, body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.path().join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        format!("sh {}", path.display())
+    }
+
+    fn wait_for_file(path: &std::path::Path) -> String {
+        for _ in 0..200 {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if !text.is_empty() {
+                    return text;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        panic!("{} never appeared", path.display());
+    }
+
+    fn message_with(app: &mut App, id: &str, text: &str, files: &[(&str, &str, &str)]) {
+        let mut post = post(id, "c3", "u2", text, 1_700_000_800_000);
+        let files: Vec<serde_json::Value> = files
+            .iter()
+            .map(|(fid, name, mime)| serde_json::json!({"id": fid, "name": name, "mime_type": mime, "size": 4}))
+            .collect();
+        post.metadata = serde_json::from_value(serde_json::json!({"files": files})).unwrap();
+        posted(app, post, &[]);
+    }
+
+    #[test]
+    fn o_opens_a_single_link_in_the_browser_and_says_when_there_is_nothing() {
+        let mut app = fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        app.settings.open.browser = program(
+            &dir,
+            "browser.sh",
+            &format!("printf '%s' \"$1\" > {}", out.display()),
+        );
+        (app.cursor, app.browsing) = (0, true);
+        press(&mut app, "o");
+        assert_eq!(app.notice, "Nothing to open");
+        message_with(&mut app, "p80", "read https://x.org/page, then reply", &[]);
+        app.cursor = app.count() - 1;
+        press(&mut app, "o");
+        assert_eq!(wait_for_file(&out), "https://x.org/page");
+        assert_eq!(app.notice, "Opened https://x.org/page");
+    }
+
+    #[test]
+    fn several_things_make_a_picker_and_a_digit_chooses() {
+        let mut app = fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        app.settings.open.browser = program(
+            &dir,
+            "browser.sh",
+            &format!("printf '%s' \"$1\" > {}", out.display()),
+        );
+        message_with(&mut app, "p81", "one https://a.org and https://b.org", &[]);
+        press(&mut app, "o");
+        assert_eq!(app.mode(), "OPEN");
+        let bottom = screen(&mut app, 100, 12).pop().unwrap();
+        assert!(
+            bottom.starts_with(" OPEN  1 https://a.org") && bottom.contains("2 https://b.org"),
+            "{bottom:?}"
+        );
+        press(&mut app, "z");
+        assert_eq!(app.mode(), "OPEN");
+        press(&mut app, "2");
+        assert_eq!(app.mode(), "NORMAL");
+        assert_eq!(wait_for_file(&out), "https://b.org");
+        press(&mut app, "o");
+        press_code(&mut app, KeyCode::Esc);
+        assert_eq!(app.mode(), "NORMAL");
+    }
+
+    #[tokio::test]
+    async fn an_attachment_is_downloaded_privately_and_opened_by_its_kind() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v4/files/f9"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"PIXELS".to_vec()))
+            .mount(&server)
+            .await;
+        let (mut app, mut rx) = fixture_rx();
+        app.servers[0].client = Some(Arc::new(
+            Client::connect(&server.uri(), Credentials::Token("t".into()), None)
+                .await
+                .unwrap(),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        app.settings.open.image = program(
+            &dir,
+            "image.sh",
+            &format!(
+                "printf '%s|' \"$1\" > {}; cat \"$1\" >> {}",
+                out.display(),
+                out.display()
+            ),
+        );
+        message_with(
+            &mut app,
+            "p82",
+            "look",
+            &[("f9", "../cat.png", "image/png")],
+        );
+        press(&mut app, "o");
+        assert_eq!(app.notice, "Downloading ../cat.png (4 B)…");
+        settle(&mut app, &mut rx, |a| a.notice.starts_with("Opened")).await;
+        let result = wait_for_file(&out);
+        let (path, content) = result.split_once('|').unwrap();
+        assert!(path.ends_with("/f9/cat.png"), "{path}");
+        assert_eq!(content, "PIXELS");
+        let folder = app.files.base().to_owned();
+        drop(app);
+        assert!(!folder.exists());
+    }
+
+    #[tokio::test]
+    async fn a_text_attachment_opens_in_the_pane_and_the_pane_closes_when_it_ends() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v4/files/f7"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"line one".to_vec()))
+            .mount(&server)
+            .await;
+        let (mut app, mut rx) = fixture_rx();
+        app.servers[0].client = Some(Arc::new(
+            Client::connect(&server.uri(), Credentials::Token("t".into()), None)
+                .await
+                .unwrap(),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        app.settings.open.text = program(&dir, "viewer.sh", "cat \"$1\"; sleep 0.3");
+        message_with(
+            &mut app,
+            "p83",
+            "notes",
+            &[("f7", "notes.txt", "text/plain")],
+        );
+        press(&mut app, "o");
+        settle(&mut app, &mut rx, |a| a.pane.is_some()).await;
+        assert_eq!(app.mode(), "VIEWER");
+        let lines = until_screen(&mut app, "line one");
+        assert!(
+            lines.iter().any(|l| l.starts_with("─── Viewing notes.txt")),
+            "{lines:?}"
+        );
+        settle(&mut app, &mut rx, |a| a.pane.is_none()).await;
+        assert_eq!(app.mode(), "NORMAL");
+        assert!(app.compose.is_none());
+    }
+
+    #[test]
+    fn reacting_turns_the_reaction_display_on() {
+        let mut app = fixture();
+        assert!(!app.reactions);
+        app.loaded(
+            0,
+            Loaded::Reacted(Reaction {
+                user_id: UserId("u1".into()),
+                post_id: PostId("p2".into()),
+                emoji_name: "heart".into(),
+            }),
+        );
+        assert!(app.reactions);
+        press(&mut app, "a");
+        assert!(!app.reactions);
+        app.loaded(
+            0,
+            Loaded::Unreacted(Reaction {
+                user_id: UserId("u1".into()),
+                post_id: PostId("p2".into()),
+                emoji_name: "heart".into(),
+            }),
+        );
+        assert!(app.reactions);
+    }
+
+    #[test]
+    fn yank_hands_the_text_to_the_clipboard_command_and_reports_its_failure() {
+        let (mut app, mut rx) = fixture_rx();
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("copied");
+        app.settings.copy = Some(format!("cat > {}", out.display()));
+        press(&mut app, "y");
+        assert_eq!(wait_for_file(&out), "hi");
+        app.settings.copy = Some("exit 2".into());
+        press(&mut app, "y");
+        let msg = rx.blocking_recv().unwrap();
+        app.update(msg);
+        assert!(
+            app.notice.starts_with("Copy failed: exit 2 exited"),
+            "{}",
+            app.notice
+        );
     }
 }

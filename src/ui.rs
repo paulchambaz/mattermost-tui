@@ -11,9 +11,11 @@ use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::api::types::Status;
-use crate::app::{App, Kind, REACTIONS};
+use crate::app::{App, Item, Kind, REACTIONS};
 use crate::finder;
+use crate::markdown;
 use crate::model::{self, group_with_previous, Link, Message, Server};
+use crate::open;
 use crate::term;
 
 const MARGIN: usize = 1;
@@ -106,64 +108,6 @@ pub fn truncate(s: &str, width: usize) -> String {
     out
 }
 
-/// Breaks text into lines of at most `width` cells, at spaces when it can.
-pub fn wrap(text: &str, width: usize) -> Vec<String> {
-    let mut out = Vec::new();
-    for paragraph in text.replace('\r', "").split('\n') {
-        let (mut line, mut used) = (String::new(), 0);
-        for word in paragraph.split(' ') {
-            let w = word.width();
-            if used > 0 && used + 1 + w > width {
-                out.push(std::mem::take(&mut line));
-                used = 0;
-            }
-            if used > 0 {
-                line.push(' ');
-                used += 1;
-            }
-            for c in word.chars() {
-                let cw = c.width().unwrap_or(0);
-                if used + cw > width && used > 0 {
-                    out.push(std::mem::take(&mut line));
-                    used = 0;
-                }
-                line.push(c);
-                used += cw;
-            }
-        }
-        out.push(line);
-    }
-    out
-}
-
-/// Replaces `:shortcode:` with the emoji it names; unknown names stay as they are.
-pub fn emoji(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(start) = rest.find(':') {
-        out.push_str(&rest[..start]);
-        let after = &rest[start + 1..];
-        let len = after
-            .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '+' | '-')))
-            .unwrap_or(after.len());
-        let found = (len > 0 && after[len..].starts_with(':'))
-            .then(|| emojis::get_by_shortcode(&after[..len]))
-            .flatten();
-        match found {
-            Some(e) => {
-                out.push_str(e.as_str());
-                rest = &after[len + 1..];
-            }
-            None => {
-                out.push(':');
-                rest = after;
-            }
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
 /// The first item to show so that `active` fits in `room` cells.
 fn first_visible(widths: &[usize], active: usize, room: usize) -> usize {
     (0..active)
@@ -232,45 +176,74 @@ fn pad_right(s: &str, width: usize) -> String {
     format!("{s}{}", " ".repeat(width.saturating_sub(s.width())))
 }
 
-fn mention_spans(line: &str, base: Style, me: &str) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    let mut plain = String::new();
-    let mut rest = line;
-    while let Some(at) = rest.find('@') {
-        let (before, from) = rest.split_at(at);
-        let name = from[1..]
-            .split(|c: char| !(c.is_alphanumeric() || matches!(c, '.' | '_' | '-')))
-            .next()
-            .unwrap_or_default()
-            .trim_end_matches(['.', '-']);
-        let glued = before
-            .chars()
-            .next_back()
-            .is_some_and(char::is_alphanumeric);
-        plain.push_str(before);
-        if name.is_empty() || glued {
-            plain.push('@');
-            rest = &from[1..];
-            continue;
+fn mention_marks(text: &markdown::Text, me: &str) -> Vec<u8> {
+    let c = &text.chars;
+    let mut marks = vec![0u8; c.len()];
+    let mut i = 0;
+    while i < c.len() {
+        let free = text.flags[i] & markdown::CODE == 0 && (i == 0 || !c[i - 1].is_alphanumeric());
+        if c[i] == '@' && free {
+            let mut j = i + 1;
+            while j < c.len() && (c[j].is_alphanumeric() || matches!(c[j], '.' | '_' | '-')) {
+                j += 1;
+            }
+            while j > i + 1 && matches!(c[j - 1], '.' | '-') {
+                j -= 1;
+            }
+            if j > i + 1 {
+                let name: String = c[i + 1..j].iter().collect();
+                let mine = name == me || matches!(name.as_str(), "all" | "channel" | "here");
+                marks[i..j].fill(if mine { 2 } else { 1 });
+                i = j;
+                continue;
+            }
         }
-        if !plain.is_empty() {
-            spans.push(Span::styled(std::mem::take(&mut plain), base));
-        }
-        let mine = name == me || matches!(name, "all" | "channel" | "here");
-        let color = if mine {
-            Color::Indexed(11)
-        } else {
-            Color::Indexed(12)
-        };
-        spans.push(Span::styled(
-            format!("@{name}"),
-            Style::new().fg(color).add_modifier(Modifier::BOLD),
-        ));
-        rest = &from[1 + name.len()..];
+        i += 1;
     }
-    plain.push_str(rest);
-    if !plain.is_empty() {
-        spans.push(Span::styled(plain, base));
+    marks
+}
+
+fn style_of(flags: markdown::Flags, mention: u8, base: Style) -> Style {
+    let mut style = base;
+    for (flag, modifier) in [
+        (markdown::BOLD, Modifier::BOLD),
+        (markdown::ITALIC, Modifier::ITALIC),
+        (markdown::STRIKE, Modifier::CROSSED_OUT),
+        (markdown::LINK, Modifier::UNDERLINED),
+    ] {
+        if flags & flag != 0 {
+            style = style.add_modifier(modifier);
+        }
+    }
+    if flags & markdown::CODE != 0 {
+        style = style.fg(Color::Indexed(6));
+    }
+    if flags & (markdown::QUOTE | markdown::MUTED) != 0 {
+        style = style.fg(Color::Indexed(8));
+    }
+    match mention {
+        1 => style.fg(Color::Indexed(12)).add_modifier(Modifier::BOLD),
+        2 => style.fg(Color::Indexed(11)).add_modifier(Modifier::BOLD),
+        _ => style,
+    }
+}
+
+fn text_spans(
+    text: &markdown::Text,
+    marks: &[u8],
+    range: std::ops::Range<usize>,
+    base: Style,
+) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut start = range.start;
+    while start < range.end {
+        let key = (text.flags[start], marks[start]);
+        let end = (start..range.end)
+            .find(|&k| (text.flags[k], marks[k]) != key)
+            .unwrap_or(range.end);
+        let run: String = text.chars[start..end].iter().collect();
+        spans.push(Span::styled(run, style_of(key.0, key.1, base)));
+        start = end;
     }
     spans
 }
@@ -382,21 +355,19 @@ fn messages_log(
         } else {
             Style::new()
         };
-        let marker = message.root.as_ref().map(|root| {
+        let mut text = markdown::Text::default();
+        if let Some(root) = &message.root {
             let author = messages
                 .iter()
                 .find(|m| &m.id == root)
                 .map_or("?", |m| server.username(&m.user));
-            format!("↪ {}", truncate(author, 12))
-        });
-        let text = emoji(&message.text);
-        let body = match &marker {
-            Some(marker) => format!("{marker} {text}"),
-            None => text,
-        };
-        let wrapped = wrap(&body, cols.text);
-        let last = wrapped.len() - 1;
-        for (n, part) in wrapped.iter().enumerate() {
+            text.push_str(&format!("↪ {} ", truncate(author, 12)), markdown::MUTED);
+        }
+        text.append(markdown::render(&message.text));
+        let marks = mention_marks(&text, me);
+        let ranges = markdown::wrap(&text.chars, cols.text);
+        let last = ranges.len() - 1;
+        for (n, range) in ranges.into_iter().enumerate() {
             let mut spans = Vec::new();
             if n == 0 {
                 spans.push(Span::raw(" ".repeat(MARGIN)));
@@ -409,17 +380,7 @@ fn messages_log(
             } else {
                 spans.push(Span::raw(indent.clone()));
             }
-            let rest = match (&marker, n) {
-                (Some(marker), 0) => match part.strip_prefix(marker.as_str()) {
-                    Some(rest) => {
-                        spans.push(Span::styled(marker.clone(), muted()));
-                        rest
-                    }
-                    None => part,
-                },
-                _ => part,
-            };
-            spans.extend(mention_spans(rest, base, me));
+            spans.extend(text_spans(&text, &marks, range, base));
             if message.edited && n == last {
                 spans.push(Span::styled(" *", muted()));
             }
@@ -441,7 +402,7 @@ fn messages_log(
                 spans.push(Span::styled(
                     format!(
                         "{sep}{} {}",
-                        emoji(&format!(":{}:", group.name)),
+                        markdown::emoji(&format!(":{}:", group.name)),
                         group.users.len()
                     ),
                     style,
@@ -452,7 +413,10 @@ fn messages_log(
         for file in &message.files {
             log.lines.push(Line::from(vec![
                 Span::raw(indent.clone()),
-                Span::styled(format!("[file: {file}]"), muted()),
+                Span::styled(
+                    format!("[file: {}, {}]", file.name, open::human_size(file.size)),
+                    muted(),
+                ),
             ]));
         }
         log.spans.push((start, log.lines.len() - 1));
@@ -588,13 +552,34 @@ fn picker_line(width: usize) -> Line<'static> {
     let line = Style::new().add_modifier(Modifier::REVERSED);
     let mut spans = vec![Span::styled(" REACT ", line.add_modifier(Modifier::BOLD))];
     for (i, name) in REACTIONS.iter().enumerate() {
-        let glyph = emoji(&format!(":{name}:"));
+        let glyph = markdown::emoji(&format!(":{name}:"));
         spans.push(Span::styled(" ", line));
         spans.push(Span::styled(
             (i + 1).to_string(),
             line.add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
         ));
         spans.push(Span::styled(format!(" {glyph} "), line));
+    }
+    let used: usize = spans.iter().map(Span::width).sum();
+    spans.push(Span::styled(" ".repeat(width.saturating_sub(used)), line));
+    Line::from(spans)
+}
+
+/// The things `o` can open, written on the status line.
+fn open_line(items: &[Item], width: usize) -> Line<'static> {
+    let line = Style::new().add_modifier(Modifier::REVERSED);
+    let mut spans = vec![Span::styled(" OPEN ", line.add_modifier(Modifier::BOLD))];
+    for (i, item) in items.iter().take(9).enumerate() {
+        let label = match item {
+            Item::Link(url) => truncate(url, 30),
+            Item::File(file) => truncate(&file.name, 30),
+        };
+        spans.push(Span::styled(" ", line));
+        spans.push(Span::styled(
+            (i + 1).to_string(),
+            line.add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        ));
+        spans.push(Span::styled(format!(" {label} "), line));
     }
     let used: usize = spans.iter().map(Span::width).sum();
     spans.push(Span::styled(" ".repeat(width.saturating_sub(used)), line));
@@ -926,10 +911,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     if let Some(pane) = &mut app.pane {
-        let label = app
-            .compose
-            .as_ref()
-            .map_or(String::new(), |c| compose_title(&c.kind));
+        let label = match (pane.is_viewer(), &app.compose) {
+            (true, _) => format!("Viewing {}", pane.title()),
+            (false, Some(compose)) => compose_title(&compose.kind),
+            (false, None) => String::new(),
+        };
         let rule = format!("─── {label} ");
         let rest = width.saturating_sub(rule.width());
         let line = Line::styled(format!("{rule}{}", "─".repeat(rest)), muted());
@@ -969,10 +955,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             input.y,
         ));
     }
-    let bottom = match (&app.finder, app.picker) {
-        (Some(_), _) => wildmenu(app, width),
-        (None, true) => picker_line(width),
-        (None, false) => status_line(app, width, percent),
+    let bottom = match (&app.finder, app.picker, &app.opener) {
+        (Some(_), ..) => wildmenu(app, width),
+        (None, true, _) => picker_line(width),
+        (None, false, Some(items)) => open_line(items, width),
+        (None, false, None) => status_line(app, width, percent),
     };
     frame.render_widget(Paragraph::new(bottom), status);
 }
@@ -1018,43 +1005,6 @@ pub mod tests {
         assert_eq!(truncate("日本語です", 5), "日本…");
         assert_eq!(truncate("abc", 3), "abc");
         assert_eq!(truncate("abc", 0), "");
-    }
-
-    #[test]
-    fn wrap_breaks_at_spaces_and_cuts_long_words() {
-        assert_eq!(wrap("one two three", 7), ["one two", "three"]);
-        assert_eq!(wrap("abcdefghij", 4), ["abcd", "efgh", "ij"]);
-        assert_eq!(wrap("a\n\nb", 5), ["a", "", "b"]);
-        assert_eq!(wrap("日本語 日本", 6), ["日本語", "日本"]);
-        assert_eq!(wrap("", 5), [""]);
-    }
-
-    #[test]
-    fn shortcodes_become_emoji() {
-        assert_eq!(emoji("well done :tada:!"), "well done 🎉!");
-        assert_eq!(
-            emoji(":+1: :nope_nope: 12:30:45"),
-            "👍 :nope_nope: 12:30:45"
-        );
-        assert_eq!(emoji("a::b"), "a::b");
-    }
-
-    #[test]
-    fn mentions_are_split_out() {
-        let text = |spans: Vec<Span>| {
-            spans
-                .iter()
-                .map(|s| s.content.to_string())
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(
-            text(mention_spans("hi @ana. mail a@b.c", Style::new(), "paul")),
-            ["hi ", "@ana", ". mail a@b.c"]
-        );
-        assert_eq!(
-            mention_spans("@paul", Style::new(), "paul")[0].style.fg,
-            Some(Color::Indexed(11))
-        );
     }
 
     #[test]
@@ -1109,7 +1059,7 @@ pub mod tests {
             lines.contains("↪ ana") || lines.contains("↪ paul"),
             "{lines}"
         );
-        assert!(lines.contains("[file: a.png]"));
+        assert!(lines.contains("[file: a.png, 12 B]"));
         assert!(lines.contains("ana"));
         assert!(lines.contains(" *"));
     }
@@ -1270,5 +1220,75 @@ pub mod tests {
         let row = screen(&mut app, 80, 12).pop().unwrap();
         assert!(row.starts_with(" VISUAL"), "{row:?}");
         assert!(has_background(&mut app, 3) && has_background(&mut app, 4));
+    }
+
+    #[test]
+    fn mentions_are_marked_outside_code_and_yours_stands_out() {
+        let text = markdown::render("hi @ana. mail a@b.c `@code` @paul @here");
+        let marks = mention_marks(&text, "paul");
+        let at = |word: &str| {
+            text.to_plain()
+                .find(word)
+                .map(|b| text.to_plain()[..b].chars().count())
+                .unwrap()
+        };
+        assert_eq!(marks[at("@ana")], 1);
+        assert_eq!(marks[at("@ana") + 4], 0);
+        assert_eq!(marks[at("a@b")], 0);
+        assert_eq!(marks[at("@code")], 0);
+        assert_eq!(marks[at("@paul")], 2);
+        assert_eq!(marks[at("@here")], 2);
+    }
+
+    fn cell_at(app: &mut App, needle: &str) -> ratatui::buffer::Cell {
+        let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let at = buffer
+            .content()
+            .iter()
+            .position(|c| c.symbol() == needle.chars().next().unwrap().to_string())
+            .and_then(|_| {
+                buffer
+                    .content()
+                    .windows(needle.chars().count())
+                    .position(|w| w.iter().map(|c| c.symbol()).collect::<String>() == needle)
+            })
+            .unwrap();
+        buffer.content()[at].clone()
+    }
+
+    #[test]
+    fn markdown_shows_as_styles_and_system_posts_are_muted() {
+        let mut app = fixture();
+        let text = "**strong** and `code` and > nothing\n> quoted\n[docs](https://x.org/d)";
+        let mut post = crate::app::tests::post("p77", "c3", "u2", text, 1_700_000_900_000);
+        post.kind = String::new();
+        crate::app::tests::posted(&mut app, post, &[]);
+        let mut system = crate::app::tests::post(
+            "p78",
+            "c3",
+            "u2",
+            "ana joined the channel",
+            1_700_001_000_000,
+        );
+        system.kind = "system_join_channel".into();
+        crate::app::tests::posted(&mut app, system, &[]);
+        let shown = screen(&mut app, 80, 16).join("\n");
+        assert!(shown.contains("strong and code and > nothing"), "{shown}");
+        assert!(
+            shown.contains("│ quoted") && shown.contains("docs (https://x.org/d)"),
+            "{shown}"
+        );
+        assert!(cell_at(&mut app, "strong")
+            .modifier
+            .contains(Modifier::BOLD));
+        assert_eq!(cell_at(&mut app, "code and").fg, Color::Indexed(6));
+        assert!(cell_at(&mut app, "docs")
+            .modifier
+            .contains(Modifier::UNDERLINED));
+        assert_eq!(cell_at(&mut app, "ana joined").fg, Color::Indexed(8));
+        let joined = shown.lines().find(|l| l.contains("ana joined")).unwrap();
+        assert!(!joined.contains(" ana  ana joined"), "{joined}");
     }
 }

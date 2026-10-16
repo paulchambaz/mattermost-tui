@@ -36,6 +36,69 @@ pub enum Credentials {
     Token(String),
 }
 
+/// The programs that open links and files.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Open {
+    pub image: String,
+    pub video: String,
+    pub browser: String,
+    pub text: String,
+    pub other: String,
+}
+
+impl Default for Open {
+    fn default() -> Self {
+        let any = || "xdg-open".to_owned();
+        Self {
+            image: any(),
+            video: any(),
+            browser: any(),
+            text: any(),
+            other: any(),
+        }
+    }
+}
+
+/// The user's choices, read from `config.toml`; every key is optional.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Settings {
+    pub editor: Option<String>,
+    pub copy: Option<String>,
+    pub open: Open,
+}
+
+impl Settings {
+    /// The program `ctrl+g` runs: the setting, else `$EDITOR`, else `vi`.
+    pub fn editor(&self, environment: Option<&str>) -> String {
+        let chosen = self.editor.as_deref().filter(|e| !e.is_empty());
+        let fallback = environment.filter(|e| !e.is_empty());
+        chosen.or(fallback).unwrap_or("vi").to_owned()
+    }
+}
+
+/// Where the settings live.
+///
+/// # Errors
+/// Fails when no home directory can be found.
+pub fn settings_path() -> Result<PathBuf> {
+    let dirs = ProjectDirs::from("", "", "mm").context("no home directory")?;
+    Ok(dirs.config_dir().join("config.toml"))
+}
+
+/// Reads the settings; a missing file means the defaults.
+///
+/// # Errors
+/// Fails when the file cannot be read or parsed.
+pub fn load_settings(path: &Path) -> Result<Settings> {
+    match fs::read_to_string(path) {
+        Ok(text) => toml::from_str(&text).with_context(|| format!("parsing {}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Settings::default()),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct File {
     #[serde(default, rename = "server")]
@@ -206,5 +269,43 @@ mod tests {
             ..server()
         };
         assert!(matches!(s.credentials().unwrap(), Credentials::Token(t) if t == "abc"));
+    }
+
+    #[test]
+    fn settings_default_to_xdg_open_and_the_environment_editor() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = load_settings(&dir.path().join("none.toml")).unwrap();
+        assert_eq!(settings.open, Open::default());
+        assert_eq!(settings.open.image, "xdg-open");
+        assert_eq!(settings.editor(Some("nano")), "nano");
+        assert_eq!(settings.editor(None), "vi");
+        assert_eq!(settings.editor(Some("")), "vi");
+    }
+
+    #[test]
+    fn a_partial_file_keeps_the_rest_and_the_editor_setting_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "editor = \"vi\"\n[open]\nimage = \"nsxiv\"\ntext = \"nvim -R\"\n",
+        )
+        .unwrap();
+        let settings = load_settings(&path).unwrap();
+        assert_eq!(settings.open.image, "nsxiv");
+        assert_eq!(settings.open.text, "nvim -R");
+        assert_eq!(settings.open.video, "xdg-open");
+        assert_eq!(settings.editor(Some("nano")), "vi");
+        assert_eq!(settings.copy, None);
+    }
+
+    #[test]
+    fn a_typo_or_a_broken_file_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "edtor = \"vi\"\n").unwrap();
+        assert!(load_settings(&path).is_err());
+        fs::write(&path, "editor = \n").unwrap();
+        assert!(load_settings(&path).is_err());
     }
 }

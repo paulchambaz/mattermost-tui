@@ -29,6 +29,15 @@ pub struct Reactions {
     pub users: Vec<UserId>,
 }
 
+/// A file attached to a post.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attachment {
+    pub id: String,
+    pub name: String,
+    pub mime: String,
+    pub size: i64,
+}
+
 /// A post, ready to be shown.
 #[derive(Debug, Clone)]
 pub struct Message {
@@ -40,7 +49,7 @@ pub struct Message {
     pub root: Option<PostId>,
     pub edited: bool,
     pub system: bool,
-    pub files: Vec<String>,
+    pub files: Vec<Attachment>,
     pub reactions: Vec<Reactions>,
 }
 
@@ -66,7 +75,12 @@ impl Message {
                 .files
                 .iter()
                 .flatten()
-                .map(|f| f.name.clone())
+                .map(|f| Attachment {
+                    id: f.id.clone(),
+                    name: f.name.clone(),
+                    mime: f.mime_type.clone(),
+                    size: f.size,
+                })
                 .collect(),
             reactions: {
                 let mut groups = Vec::new();

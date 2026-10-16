@@ -16,8 +16,15 @@ screen. Keys are single letters, with no sequences. Press *?* inside *mm* for th
 
 # FILES
 
+_~/.config/mm/servers.toml_
+	The servers and how to log in to each. Added with *:new-server*.
+
 _~/.config/mm/config.toml_
-	Server address and access token.
+	Optional settings: *editor* (the program run by *ctrl+g*), *copy* (the
+	command that receives copied text) and the *[open]* table with the
+	programs for *image*, *video*, *browser*, *text* and *other* that *o*
+	starts. Each program defaults to *xdg-open*; the editor defaults to
+	*$EDITOR*, then *vi*.
 
 # LICENSE
 

@@ -7,7 +7,9 @@ mod config;
 mod debug;
 mod finder;
 mod input;
+mod markdown;
 mod model;
+mod open;
 mod term;
 mod ui;
 mod unread;
@@ -34,6 +36,7 @@ async fn main() -> Result<()> {
             (server, credentials)
         })
         .collect();
+    let settings = config::load_settings(&config::settings_path()?)?;
     let (tx, rx) = unbounded_channel();
 
     let mut terminal = ratatui::init();
@@ -53,6 +56,7 @@ async fn main() -> Result<()> {
         }
     });
     let mut app = App::new(boot, path, tx);
+    app.settings = settings;
     let result = run(&mut terminal, &mut app, rx).await;
     drop(app);
     let _ = execute!(std::io::stdout(), DisableBracketedPaste);

@@ -124,7 +124,12 @@ pub struct Reaction {
 /// A file attached to a post.
 #[derive(Debug, Clone, Deserialize)]
 pub struct FileInfo {
+    pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub mime_type: String,
+    #[serde(default)]
+    pub size: i64,
 }
 
 /// Extra data the server sends along with a post.
