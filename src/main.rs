@@ -6,6 +6,7 @@ mod config;
 mod input;
 mod model;
 mod ui;
+mod unread;
 mod ws;
 
 use anyhow::Result;

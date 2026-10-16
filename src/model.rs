@@ -191,30 +191,19 @@ pub struct Chan {
 }
 
 impl Chan {
-    /// Whether the tab should be marked: posts newer than both the server's last view
-    /// and `seen`, or a mention in a muted channel.
-    pub fn unread(&self, seen: i64) -> bool {
+    /// Whether the tab should be marked: posts newer than the last view, or a mention in a muted channel.
+    pub fn unread(&self) -> bool {
         let Some(member) = &self.member else {
             return false;
         };
         let muted = member.notify_props.mark_unread == "mention";
-        let newer = self.info.last_post_at > member.last_viewed_at.max(seen);
-        self.mentions(seen) || (!muted && newer)
+        let newer = self.info.last_post_at > member.last_viewed_at;
+        self.mentions() || (!muted && newer)
     }
 
-    /// Whether someone mentioned the reader in posts newer than `seen`.
-    pub fn mentions(&self, seen: i64) -> bool {
-        let counted = self.member.as_ref().is_some_and(|m| m.mention_count > 0);
-        counted && self.info.last_post_at > seen
-    }
-
-    /// Index of the first message newer than the last view, when it is not the first one.
-    pub fn first_unread(&self, messages: &[Message]) -> Option<usize> {
-        let last = self.member.as_ref()?.last_viewed_at;
-        messages
-            .iter()
-            .position(|m| m.ms > last)
-            .filter(|&i| i > 0 && last > 0)
+    /// Whether someone mentioned the reader since the last view.
+    pub fn mentions(&self) -> bool {
+        self.member.as_ref().is_some_and(|m| m.mention_count > 0)
     }
 }
 
@@ -296,7 +285,6 @@ pub struct Server {
     pub teams: Vec<Team>,
     pub messages: HashMap<ChannelId, Vec<Message>>,
     pub loading: HashSet<ChannelId>,
-    pub seen: HashMap<ChannelId, i64>,
     pub refreshed: HashSet<ChannelId>,
     pub link: Link,
 }
@@ -313,7 +301,6 @@ impl Server {
             teams: Vec::new(),
             messages: HashMap::new(),
             loading: HashSet::new(),
-            seen: HashMap::new(),
             refreshed: HashSet::new(),
             link: Link::Connecting,
         }
@@ -343,14 +330,18 @@ impl Server {
         }
     }
 
-    /// Whether a tab is marked unread, counting what was read in this program.
-    pub fn unread(&self, chan: &Chan) -> bool {
-        chan.unread(self.seen.get(&chan.info.id).copied().unwrap_or(0))
-    }
-
-    /// Whether a tab is marked with a mention, counting what was read in this program.
-    pub fn mentioned(&self, chan: &Chan) -> bool {
-        chan.mentions(self.seen.get(&chan.info.id).copied().unwrap_or(0))
+    /// Records that a channel was viewed: nothing in it is unread any more.
+    pub fn mark_viewed(&mut self, channel: &ChannelId) {
+        let chans = self
+            .teams
+            .iter_mut()
+            .flat_map(|t| t.chans.iter_mut().flatten());
+        for Chan { info, member } in chans.filter(|c| &c.info.id == channel) {
+            if let Some(member) = member {
+                member.last_viewed_at = member.last_viewed_at.max(info.last_post_at);
+                member.mention_count = 0;
+            }
+        }
     }
 
     /// The other person of a direct channel, whose name is `id__id`.
@@ -469,26 +460,28 @@ mod tests {
 
     #[test]
     fn unread_follows_timestamps_and_mutes() {
-        assert!(chan(10, Some(member("c", 5, 0, "all"))).unread(0));
-        assert!(!chan(5, Some(member("c", 5, 0, "all"))).unread(0));
-        assert!(!chan(10, Some(member("c", 5, 0, "mention"))).unread(0));
-        assert!(chan(10, Some(member("c", 5, 2, "mention"))).unread(0));
-        assert!(!chan(10, None).unread(0));
+        assert!(chan(10, Some(member("c", 5, 0, "all"))).unread());
+        assert!(!chan(5, Some(member("c", 5, 0, "all"))).unread());
+        assert!(!chan(10, Some(member("c", 5, 0, "mention"))).unread());
+        assert!(chan(10, Some(member("c", 5, 2, "mention"))).unread());
+        assert!(!chan(10, None).unread());
     }
 
     #[test]
-    fn what_was_seen_here_is_not_unread_or_mentioned() {
+    fn viewing_a_channel_clears_it_everywhere_it_is_listed() {
+        let mut server = Server::new("work".into());
+        let team = |chans| Team {
+            info: serde_json::from_value(serde_json::json!({"id": "t", "display_name": "T"}))
+                .unwrap(),
+            chans: Some(chans),
+            loading: false,
+            cur: 0,
+        };
         let c = chan(10, Some(member("c", 5, 2, "all")));
-        assert!(c.unread(9) && c.mentions(9));
-        assert!(!c.unread(10) && !c.mentions(10));
-    }
-
-    #[test]
-    fn first_unread_skips_the_first_message() {
-        let c = chan(0, Some(member("c", NOON + 500, 0, "all")));
-        let list = [msg("a", NOON), msg("a", NOON + 1000), msg("b", NOON + 2000)];
-        assert_eq!(c.first_unread(&list), Some(1));
-        assert_eq!(c.first_unread(&list[1..]), None);
+        server.teams = vec![team(vec![c.clone()]), team(vec![c])];
+        server.mark_viewed(&ChannelId("c".into()));
+        let all = server.teams.iter().flat_map(|t| t.chans.iter().flatten());
+        assert!(all.clone().count() == 2 && all.into_iter().all(|c| !c.unread() && !c.mentions()));
     }
 
     #[test]

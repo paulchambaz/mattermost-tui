@@ -15,6 +15,7 @@ use crate::api::{Client, Error};
 use crate::config::{self, Credentials, ServerConfig};
 use crate::input::{self, Command, Line, Step, Wizard};
 use crate::model::{self, group_start, group_with_previous, Link, Message, Server, Team};
+use crate::unread;
 use crate::ws::{self, Event, Ws};
 
 const POSTS_PER_PAGE: u32 = 60;
@@ -45,7 +46,26 @@ pub enum Loaded {
         list: PostList,
     },
     Users(Vec<User>),
+    Viewed,
     Failed(String),
+}
+
+/// What entering a channel should put under the cursor.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Goal {
+    #[default]
+    Unread,
+    Mention,
+}
+
+/// The channel being read, and how much of it was already read when it was entered.
+#[derive(Debug)]
+struct Entry {
+    server: usize,
+    channel: ChannelId,
+    from: i64,
+    goal: Goal,
+    placed: bool,
 }
 
 /// A logged-in connection and the account behind it.
@@ -73,6 +93,8 @@ pub struct App {
     pub wizard: Option<Wizard>,
     pub help: Option<usize>,
     pub quit: bool,
+    entry: Option<Entry>,
+    goal: Goal,
 }
 
 impl App {
@@ -99,6 +121,8 @@ impl App {
             wizard: None,
             help: None,
             quit: false,
+            entry: None,
+            goal: Goal::Unread,
         };
         for (i, (config, credentials)) in boot.into_iter().enumerate() {
             app.servers.push(Server::new(config.name.clone()));
@@ -189,6 +213,9 @@ impl App {
             'g' => self.move_cursor(0),
             'G' => self.move_cursor(usize::MAX),
             'a' => self.reactions = !self.reactions,
+            'n' => self.next_unread(),
+            'N' => self.next_mention(),
+            'c' => self.mark_read(),
             'w' => self.next_group(),
             'b' => self.previous_group(),
             'J' => self.move_channel(1),
@@ -372,15 +399,25 @@ impl App {
     fn move_channel(&mut self, step: isize) {
         let Some(team) = self
             .servers
-            .get_mut(self.server)
-            .and_then(|s| s.teams.get_mut(self.team))
+            .get(self.server)
+            .and_then(|s| s.teams.get(self.team))
         else {
             return;
         };
         let Some(count) = team.chans.as_ref().map(Vec::len).filter(|&n| n > 0) else {
             return;
         };
-        team.cur = team.cur.saturating_add_signed(step).min(count - 1);
+        self.go_channel(team.cur.saturating_add_signed(step).min(count - 1));
+    }
+
+    fn go_channel(&mut self, index: usize) {
+        if let Some(team) = self
+            .servers
+            .get_mut(self.server)
+            .and_then(|s| s.teams.get_mut(self.team))
+        {
+            team.cur = index;
+        }
         self.reset_view();
         self.ensure();
     }
@@ -429,6 +466,17 @@ impl App {
                         cur: 0,
                     })
                     .collect();
+                let ids: Vec<TeamId> = server
+                    .teams
+                    .iter_mut()
+                    .map(|t| {
+                        t.loading = true;
+                        t.info.id.clone()
+                    })
+                    .collect();
+                for id in ids {
+                    self.fetch_channels(i, id);
+                }
             }
             Loaded::Channels {
                 team,
@@ -468,6 +516,7 @@ impl App {
                 server.messages.insert(channel, messages);
                 self.fetch_users(i, ids);
             }
+            Loaded::Viewed => {}
             Loaded::Users(users) => {
                 server
                     .users
@@ -534,7 +583,7 @@ impl App {
             return;
         };
         let me = server.me.as_ref().map(|m| m.id.clone());
-        let (mut touched, mut removed, mut refresh) = (None, None, false);
+        let (mut touched, mut removed, mut refresh, mut view) = (None, None, false, None);
         let mut ids = Vec::new();
         match event {
             Event::Posted { post, mentions } => {
@@ -553,9 +602,9 @@ impl App {
                         member.mention_count += 1;
                     }
                 }
-                if mine {
-                    let seen = server.seen.entry(channel.clone()).or_insert(0);
-                    *seen = (*seen).max(post.create_at);
+                if mine || current.as_ref() == Some(&channel) {
+                    server.mark_viewed(&channel);
+                    view = Some(channel.clone());
                 }
                 refresh = !known && server.refreshed.insert(channel.clone());
                 ids = server.unknown(std::iter::once(&post.user_id));
@@ -587,21 +636,13 @@ impl App {
                     .values_mut()
                     .for_each(|l| model::unreact(l, &reaction));
             }
-            Event::Viewed(channel) => {
-                let chans = server
-                    .teams
-                    .iter_mut()
-                    .flat_map(|t| t.chans.iter_mut().flatten());
-                for model::Chan { info, member } in chans.filter(|c| c.info.id == channel) {
-                    if let Some(member) = member {
-                        member.last_viewed_at = member.last_viewed_at.max(info.last_post_at);
-                        member.mention_count = 0;
-                    }
-                }
-            }
+            Event::Viewed(channel) => server.mark_viewed(&channel),
         }
         if refresh {
             self.refresh_channels(i);
+        }
+        if let Some(channel) = view.filter(|c| current.as_ref() == Some(c)) {
+            self.send_view(i, channel, None);
         }
         self.fetch_users(i, ids);
         if touched.is_some() && touched == current {
@@ -626,42 +667,17 @@ impl App {
         }
     }
 
-    fn mark_seen(&mut self) {
-        let Some(server) = self.servers.get_mut(self.server) else {
-            return;
-        };
-        let chan = server
-            .teams
-            .get(self.team)
-            .and_then(|t| t.chans.as_ref()?.get(t.cur));
-        let Some((id, last_post)) = chan.map(|c| (c.info.id.clone(), c.info.last_post_at)) else {
-            return;
-        };
-        let Some(newest) = server
-            .messages
-            .get(&id)
-            .map(|m| m.last().map_or(0, |m| m.ms))
-        else {
-            return;
-        };
-        let seen = server.seen.entry(id).or_insert(0);
-        *seen = (*seen).max(last_post.max(newest));
-    }
-
     fn ensure(&mut self) {
-        self.mark_seen();
         let (i, t) = (self.server, self.team);
         let Some(server) = self.servers.get_mut(i) else {
             return;
         };
-        if server.client.is_none() {
-            return;
-        }
+        let has_client = server.client.is_some();
         let Some(team) = server.teams.get_mut(t) else {
             return;
         };
         if team.chans.is_none() {
-            if !team.loading {
+            if has_client && !team.loading {
                 team.loading = true;
                 let id = team.info.id.clone();
                 self.fetch_channels(i, id);
@@ -672,9 +688,160 @@ impl App {
         let Some(id) = chan.map(|c| c.info.id.clone()) else {
             return;
         };
-        if !server.messages.contains_key(&id) {
+        let missing = !server.messages.contains_key(&id);
+        self.enter();
+        if missing {
             self.fetch_posts(i, id);
         }
+        self.place();
+    }
+
+    fn enter(&mut self) {
+        let Some((_, chan)) = self.channel() else {
+            return;
+        };
+        let (id, from) = (
+            chan.info.id.clone(),
+            chan.member.as_ref().map_or(0, |m| m.last_viewed_at),
+        );
+        let same = |e: &Entry| e.server == self.server && e.channel == id;
+        if self.entry.as_ref().is_some_and(same) {
+            return;
+        }
+        let prev = self
+            .entry
+            .take()
+            .filter(|e| e.server == self.server)
+            .map(|e| e.channel);
+        let goal = std::mem::take(&mut self.goal);
+        self.entry = Some(Entry {
+            server: self.server,
+            channel: id.clone(),
+            from,
+            goal,
+            placed: false,
+        });
+        if let Some(server) = self.servers.get_mut(self.server) {
+            server.mark_viewed(&id);
+        }
+        self.send_view(self.server, id, prev);
+    }
+
+    fn place(&mut self) {
+        let Some(entry) = self.entry.as_ref().filter(|e| !e.placed) else {
+            return;
+        };
+        let (from, goal) = (entry.from, entry.goal);
+        let Some((server, chan)) = self.channel() else {
+            return;
+        };
+        let (Some(messages), Some(me)) = (server.messages.get(&chan.info.id), server.me.as_ref())
+        else {
+            return;
+        };
+        let mention = || unread::first_mention(messages, from, None, chan.info.kind, me);
+        let target = match goal {
+            Goal::Mention => mention().or_else(|| unread::first_unread(messages, from)),
+            Goal::Unread => unread::first_unread(messages, from),
+        };
+        if let Some(entry) = &mut self.entry {
+            entry.placed = true;
+        }
+        match target {
+            Some(index) => self.move_cursor(index),
+            None => self.reset_view(),
+        }
+    }
+
+    fn send_view(&self, i: usize, channel: ChannelId, prev: Option<ChannelId>) {
+        let Some(client) = self.servers.get(i).and_then(|s| s.client.clone()) else {
+            return;
+        };
+        self.spawn(i, async move {
+            match client.view(&channel, prev.as_ref()).await {
+                Ok(()) => Loaded::Viewed,
+                Err(e) => Loaded::Failed(e.to_string()),
+            }
+        });
+    }
+
+    /// Where the reader had read up to when the open channel was entered.
+    pub fn unread_from(&self) -> i64 {
+        self.entry.as_ref().map_or(0, |e| e.from)
+    }
+
+    fn next_unread(&mut self) {
+        let first = self
+            .messages()
+            .and_then(|m| unread::first_unread(m, self.unread_from()));
+        if let Some(first) = first.filter(|&f| !self.browsing || self.cursor < f) {
+            return self.move_cursor(first);
+        }
+        let Some(team) = self
+            .servers
+            .get(self.server)
+            .and_then(|s| s.teams.get(self.team))
+        else {
+            return;
+        };
+        let Some(chans) = &team.chans else {
+            return;
+        };
+        match unread::next_marked(chans.len(), team.cur, |i| {
+            i != team.cur && chans[i].unread()
+        }) {
+            Some(index) => self.go_channel(index),
+            None => self.notice = "No other unread channel in this team".into(),
+        }
+    }
+
+    fn next_mention(&mut self) {
+        let here = self.channel().and_then(|(server, chan)| {
+            let (messages, me) = (server.messages.get(&chan.info.id)?, server.me.as_ref()?);
+            let after = self.browsing.then_some(self.cursor);
+            unread::first_mention(messages, self.unread_from(), after, chan.info.kind, me)
+        });
+        if let Some(index) = here {
+            return self.move_cursor(index);
+        }
+        let current = self.channel().map(|(_, chan)| chan.info.id.clone());
+        let mut places = Vec::new();
+        let mut here = 0;
+        for (s, server) in self.servers.iter().enumerate() {
+            for (t, team) in server.teams.iter().enumerate() {
+                for (c, chan) in team.chans.iter().flatten().enumerate() {
+                    let open = s == self.server && Some(&chan.info.id) == current.as_ref();
+                    if (s, t, c) == (self.server, self.team, team.cur) {
+                        here = places.len();
+                    }
+                    places.push((s, t, c, chan.mentions() && !open));
+                }
+            }
+        }
+        match unread::next_marked(places.len(), here, |i| places[i].3) {
+            Some(i) => {
+                let (s, t, c, _) = places[i];
+                (self.server, self.team) = (s, t);
+                self.goal = Goal::Mention;
+                self.go_channel(c);
+            }
+            None => self.notice = "No unread mention".into(),
+        }
+    }
+
+    fn mark_read(&mut self) {
+        let Some((_, chan)) = self.channel() else {
+            return;
+        };
+        let (id, last_post) = (chan.info.id.clone(), chan.info.last_post_at);
+        if let Some(entry) = &mut self.entry {
+            entry.from = last_post;
+        }
+        if let Some(server) = self.servers.get_mut(self.server) {
+            server.mark_viewed(&id);
+        }
+        self.send_view(self.server, id, None);
+        self.notice = "Marked as read".into();
     }
 
     fn fetch_channels(&self, i: usize, team: TeamId) {
@@ -783,10 +950,12 @@ async fn open(url: &str, credentials: Credentials, mfa: Option<&str>) -> Result<
 pub mod tests {
     use ratatui::crossterm::event::{KeyEventKind, KeyEventState};
     use serde::de::DeserializeOwned;
+    use std::sync::Arc;
     use tokio::sync::mpsc::unbounded_channel;
 
     use super::*;
     use crate::api::types::{Post, PostList, Reaction};
+    use crate::api::Client;
     use crate::ui::tests::screen;
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -1078,10 +1247,42 @@ pub mod tests {
         assert!(!tabs(&mut app).contains("•"));
     }
 
+    fn members_viewed_up_to(ms: i64) -> Vec<ChannelMember> {
+        let mut members: Vec<ChannelMember> = json("members");
+        members[0].last_viewed_at = ms;
+        members[0].mention_count = 0;
+        members
+    }
+
     #[test]
-    fn what_was_read_here_stays_read_after_a_refresh() {
+    fn entering_a_channel_clears_its_tab_and_a_refresh_with_the_server_state_agrees() {
         let mut app = fixture();
         press(&mut app, "J");
+        let member = app.servers[0].teams[0].chans.as_ref().unwrap()[1]
+            .member
+            .clone()
+            .unwrap();
+        assert_eq!(
+            (member.last_viewed_at, member.mention_count),
+            (1_700_000_060_000, 0)
+        );
+        press(&mut app, "K");
+        assert!(tabs(&mut app).contains(" #Town Square "));
+        app.loaded(
+            0,
+            Loaded::Channels {
+                team: TeamId("t1".into()),
+                channels: json("channels"),
+                members: members_viewed_up_to(1_700_000_060_000),
+                categories: Some(json("categories")),
+            },
+        );
+        assert!(tabs(&mut app).contains(" #Town Square "));
+        assert_eq!(app.servers[0].teams[0].cur, 0);
+    }
+
+    fn enter_town_square(app: &mut App) {
+        press(app, "J");
         let list: PostList = json("posts");
         app.loaded(
             0,
@@ -1090,21 +1291,175 @@ pub mod tests {
                 list,
             },
         );
-        assert!(tabs(&mut app).contains(" #Town Square "));
-        press(&mut app, "K");
-        app.loaded(
-            0,
-            Loaded::Channels {
-                team: TeamId("t1".into()),
-                channels: json("channels"),
-                members: json("members"),
-                categories: Some(json("categories")),
-            },
-        );
-        assert!(tabs(&mut app).contains(" #Town Square "));
-        assert_eq!(app.servers[0].teams[0].cur, 0);
     }
 
+    #[test]
+    fn the_separator_and_the_cursor_mark_the_first_unread_until_the_next_visit() {
+        let mut app = fixture();
+        enter_town_square(&mut app);
+        assert!(text(&mut app).contains("new messages"));
+        assert_eq!((app.cursor, app.browsing), (1, true));
+        press(&mut app, "KJ");
+        assert!(!text(&mut app).contains("new messages"));
+    }
+
+    #[test]
+    fn c_drops_the_separator_for_this_visit() {
+        let mut app = fixture();
+        enter_town_square(&mut app);
+        press(&mut app, "c");
+        assert_eq!(app.notice, "Marked as read");
+        assert!(!text(&mut app).contains("new messages"));
+    }
+
+    #[test]
+    fn n_goes_to_the_next_unread_channel_then_says_when_there_is_none() {
+        let mut app = fixture();
+        press(&mut app, "n");
+        assert_eq!(app.servers[0].teams[0].cur, 1);
+        let list: PostList = json("posts");
+        app.loaded(
+            0,
+            Loaded::Posts {
+                channel: ChannelId("c1".into()),
+                list,
+            },
+        );
+        press(&mut app, "n");
+        assert_eq!(app.notice, "No other unread channel in this team");
+        assert_eq!(app.servers[0].teams[0].cur, 1);
+    }
+
+    #[test]
+    fn capital_n_goes_to_the_next_mention_then_says_when_there_is_none() {
+        let mut app = fixture();
+        press(&mut app, "N");
+        assert_eq!(app.servers[0].teams[0].cur, 1);
+        let list: PostList = json("posts");
+        app.loaded(
+            0,
+            Loaded::Posts {
+                channel: ChannelId("c1".into()),
+                list,
+            },
+        );
+        assert_eq!(app.cursor, 1);
+        press(&mut app, "N");
+        assert_eq!(app.notice, "No unread mention");
+    }
+
+    #[test]
+    fn a_post_elsewhere_flags_its_tab_and_one_in_the_open_channel_does_not() {
+        let mut app = fixture();
+        app.servers[0].teams[0].chans.as_mut().unwrap()[0].member = serde_json::from_value(
+            serde_json::json!({"channel_id": "c3", "last_viewed_at": 1_700_000_000_000_i64}),
+        )
+        .unwrap();
+        press(&mut app, "J");
+        posted(
+            &mut app,
+            post("p20", "c3", "u2", "elsewhere", 1_700_000_900_000),
+            &[],
+        );
+        assert!(tabs(&mut app).contains("•+Secret"));
+        posted(
+            &mut app,
+            post("p21", "c1", "u2", "right here", 1_700_000_950_000),
+            &[],
+        );
+        assert!(!tabs(&mut app).contains("•#Town Square"));
+    }
+
+    async fn live() -> (App, wiremock::MockServer) {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"status": "OK"})),
+            )
+            .mount(&server)
+            .await;
+        let mut app = fixture();
+        let client = Client::connect(&server.uri(), Credentials::Token("t".into()), None)
+            .await
+            .unwrap();
+        app.servers[0].client = Some(Arc::new(client));
+        (app, server)
+    }
+
+    async fn sent(server: &wiremock::MockServer) -> Vec<(String, String, String)> {
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let requests = server.received_requests().await.unwrap();
+        requests
+            .iter()
+            .map(|r| {
+                (
+                    r.method.to_string(),
+                    r.url.path().to_owned(),
+                    String::from_utf8_lossy(&r.body).into_owned(),
+                )
+            })
+            .collect()
+    }
+
+    fn views(requests: &[(String, String, String)]) -> Vec<serde_json::Value> {
+        requests
+            .iter()
+            .filter(|(_, path, _)| path == "/api/v4/channels/members/me/view")
+            .map(|(_, _, body)| serde_json::from_str(body).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn entering_a_channel_sends_one_view_naming_the_channel_left() {
+        let (mut app, server) = live().await;
+        press(&mut app, "J");
+        let sent = sent(&server).await;
+        assert_eq!(
+            views(&sent),
+            [serde_json::json!({"channel_id": "c1", "prev_channel_id": "c3"})]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_post_is_viewed_in_the_open_channel_only() {
+        let (mut app, server) = live().await;
+        posted(
+            &mut app,
+            post("p30", "c1", "u2", "elsewhere", 1_700_000_900_000),
+            &[],
+        );
+        assert!(views(&sent(&server).await).is_empty());
+        posted(
+            &mut app,
+            post("p31", "c3", "u2", "here", 1_700_000_950_000),
+            &[],
+        );
+        let sent = sent(&server).await;
+        assert_eq!(
+            views(&sent),
+            [serde_json::json!({"channel_id": "c3", "prev_channel_id": ""})]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_whole_session_only_reads_and_views() {
+        let (mut app, server) = live().await;
+        press(&mut app, "JnNcKjkgGwb?q");
+        posted(
+            &mut app,
+            post("p40", "c1", "u2", "@paul hi", 1_700_000_900_000),
+            &["u1"],
+        );
+        let allowed = ["/api/v4/users/ids", "/api/v4/channels/members/me/view"];
+        for (method, path, _) in sent(&server).await {
+            assert!(
+                method == "GET" || (method == "POST" && allowed.contains(&path.as_str())),
+                "{method} {path}"
+            );
+        }
+    }
     #[test]
     fn edits_deletes_and_reactions_change_the_screen() {
         let mut app = fixture();

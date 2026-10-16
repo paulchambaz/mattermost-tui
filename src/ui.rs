@@ -9,7 +9,8 @@ use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::App;
-use crate::model::{self, group_with_previous, Chan, Link, Message, Server};
+use crate::model::{self, group_with_previous, Link, Message, Server};
+use crate::unread;
 
 const MARGIN: usize = 1;
 const TIME: usize = 5;
@@ -24,6 +25,9 @@ const BINDINGS: &[(&str, &str)] = &[
     ("H L", "previous / next team, across servers"),
     (":", "command line"),
     ("?", "this help"),
+    ("n", "next unread message, then next unread channel"),
+    ("N", "next mention, across all teams and servers"),
+    ("c", "mark the open channel as read"),
     ("a", "reactions under the messages"),
     ("q", "quit"),
 ];
@@ -260,20 +264,14 @@ fn render_log(app: &App, width: usize) -> Log {
     if messages.is_empty() {
         return notice_log(&format!("No messages in {}", server.label(chan)));
     }
-    messages_log(app, server, chan, messages, width)
+    messages_log(app, server, messages, width)
 }
 
-fn messages_log(
-    app: &App,
-    server: &Server,
-    chan: &Chan,
-    messages: &[Message],
-    width: usize,
-) -> Log {
+fn messages_log(app: &App, server: &Server, messages: &[Message], width: usize) -> Log {
     let cols = columns(width);
     let now = Local::now();
     let me = server.me.as_ref().map_or("", |u| u.username.as_str());
-    let unread_at = chan.first_unread(messages);
+    let unread_at = unread::first_unread(messages, app.unread_from());
     let indent = " ".repeat(MARGIN + cols.time + usize::from(cols.time > 0) + cols.nick + 2);
     let mut log = Log {
         lines: Vec::new(),
@@ -282,6 +280,7 @@ fn messages_log(
 
     for (i, message) in messages.iter().enumerate() {
         let previous = i.checked_sub(1).map(|p| &messages[p]);
+        let start = log.lines.len();
         if previous.is_none_or(|p| p.at.date_naive() != message.at.date_naive()) {
             log.lines
                 .push(separator(&model::day_label(message.at, now), muted()));
@@ -292,7 +291,6 @@ fn messages_log(
                 Style::new().fg(Color::Indexed(1)),
             ));
         }
-        let start = log.lines.len();
         let continuing = previous.is_some_and(|p| group_with_previous(p, message));
 
         let color = Color::Indexed(model::user_color(&message.user));
@@ -438,7 +436,7 @@ fn tabs_line(app: &App, width: usize) -> Line<'static> {
     };
 
     let active = team.cur.min(chans.len() - 1);
-    let flagged = |i: usize| i != active && server.unread(&chans[i]);
+    let flagged = |i: usize| i != active && chans[i].unread();
     let labels: Vec<String> = chans
         .iter()
         .enumerate()
@@ -447,11 +445,7 @@ fn tabs_line(app: &App, width: usize) -> Line<'static> {
                 " {}{}{} ",
                 if flagged(i) { "•" } else { "" },
                 server.label(c),
-                if i != active && server.mentioned(c) {
-                    "!"
-                } else {
-                    ""
-                }
+                if i != active && c.mentions() { "!" } else { "" }
             )
         })
         .collect();

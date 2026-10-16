@@ -133,6 +133,26 @@ impl Client {
         self.fetch(Method::GET, &path, &[], None::<&()>).await
     }
 
+    /// Marks a channel as viewed, which is the only thing besides logging in that changes the server.
+    ///
+    /// # Errors
+    /// Fails on network or server errors.
+    pub async fn view(&self, channel: &ChannelId, prev: Option<&ChannelId>) -> Result<(), Error> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            channel_id: &'a str,
+            prev_channel_id: &'a str,
+        }
+        let body = Body {
+            channel_id: &channel.0,
+            prev_channel_id: prev.map_or("", |p| p.0.as_str()),
+        };
+        let _: serde_json::Value = self
+            .fetch(Method::POST, "/channels/members/me/view", &[], Some(&body))
+            .await?;
+        Ok(())
+    }
+
     /// A page of posts, newest first, optionally those older than `before`.
     ///
     /// # Errors
@@ -389,6 +409,30 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(client.me().await.unwrap().id, UserId("u1".into()));
+    }
+
+    #[tokio::test]
+    async fn view_sends_the_channel_and_the_previous_one() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/channels/members/me/view"))
+            .and(wiremock::matchers::body_json(
+                serde_json::json!({"channel_id": "c2", "prev_channel_id": "c1"}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"status": "OK", "last_viewed_at_times": {}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = Client::connect(&server.uri(), Credentials::Token("t".into()), None)
+            .await
+            .unwrap();
+        client
+            .view(&ChannelId("c2".into()), Some(&ChannelId("c1".into())))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
