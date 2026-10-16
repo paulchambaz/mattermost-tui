@@ -300,6 +300,7 @@ mod tests {
         );
     }
 
+    #[ignore = "needs a local socket"]
     #[tokio::test]
     async fn actions_reach_the_server_with_a_sequence_number() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -417,6 +418,7 @@ mod tests {
         seen
     }
 
+    #[ignore = "needs a local socket"]
     #[tokio::test]
     async fn the_stream_comes_back_and_asks_for_a_resync() {
         assert_eq!(
@@ -425,6 +427,7 @@ mod tests {
         );
     }
 
+    #[ignore = "needs a local socket"]
     #[tokio::test]
     async fn a_rejected_upgrade_is_retried() {
         assert_eq!(

@@ -2351,6 +2351,7 @@ pub mod tests {
         server
     }
 
+    #[ignore = "needs a local socket"]
     #[tokio::test]
     async fn the_wizard_asks_for_the_mfa_code_then_saves_the_server() {
         let server = mock().await;
@@ -2377,6 +2378,7 @@ pub mod tests {
         assert_eq!(saved[0].password.as_deref(), Some("hunter2"));
     }
 
+    #[ignore = "needs a local socket"]
     #[tokio::test]
     async fn a_refused_login_asks_for_the_password_again() {
         let server = wiremock::MockServer::start().await;
@@ -2635,6 +2637,7 @@ pub mod tests {
             .collect()
     }
 
+    #[ignore = "needs a local socket"]
     #[tokio::test]
     async fn entering_a_channel_sends_one_view_naming_the_channel_left() {
         let (mut app, server) = live().await;
@@ -2646,6 +2649,7 @@ pub mod tests {
         );
     }
 
+    #[ignore = "needs a local socket"]
     #[tokio::test]
     async fn a_live_post_is_viewed_in_the_open_channel_only() {
         let (mut app, server) = live().await;
@@ -2879,6 +2883,7 @@ pub mod tests {
             .collect()
     }
 
+    #[ignore = "needs a local socket"]
     #[tokio::test]
     async fn k_at_the_top_asks_once_for_the_page_before_the_oldest() {
         let (mut app, server) = live().await;
@@ -2893,6 +2898,7 @@ pub mod tests {
         assert!(asked[0].contains("before=p1") && asked[0].contains("per_page=60"));
     }
 
+    #[ignore = "needs a local socket"]
     #[tokio::test]
     async fn the_cap_stops_paging_and_the_last_page_is_only_as_big_as_what_fits() {
         let (mut app, server) = live().await;
@@ -3096,6 +3102,7 @@ pub mod tests {
             .collect()
     }
 
+    #[ignore = "needs a local socket"]
     #[tokio::test]
     async fn a_message_is_sent_once_shown_once_and_the_input_stays_open() {
         let (mut app, mut rx, server) = writing().await;
@@ -3139,6 +3146,7 @@ pub mod tests {
         assert!(writes(&sent(&server).await).is_empty());
     }
 
+    #[ignore = "needs a local socket"]
     #[tokio::test]
     async fn a_reply_goes_to_the_thread_root() {
         let (mut app, _rx, server) = writing().await;
@@ -3171,6 +3179,7 @@ pub mod tests {
         assert_eq!(roots, ["\"p5\"", "\"p5\""]);
     }
 
+    #[ignore = "needs a local socket"]
     #[tokio::test]
     async fn only_your_own_messages_can_be_edited_and_the_edit_is_a_patch() {
         let (mut app, mut rx, server) = writing().await;
@@ -3200,6 +3209,7 @@ pub mod tests {
         );
     }
 
+    #[ignore = "needs a local socket"]
     #[tokio::test]
     async fn deleting_asks_first_and_only_y_deletes() {
         let (mut app, mut rx, server) = writing().await;
@@ -3337,6 +3347,7 @@ pub mod tests {
         }
     }
 
+    #[ignore = "needs a local socket"]
     #[tokio::test]
     async fn sending_marks_the_channel_viewed_right_after_the_post_and_only_once() {
         let (mut app, mut rx, server) = writing().await;
@@ -3395,6 +3406,7 @@ pub mod tests {
         panic!("{wanted:?} never appeared: {:?}", screen(app, 60, 16));
     }
 
+    #[ignore = "needs a pseudo-terminal"]
     #[test]
     fn ctrl_g_from_normal_mode_opens_the_editor_in_the_lower_half() {
         let mut app = fixture();
@@ -3416,6 +3428,7 @@ pub mod tests {
         assert_eq!(pane_rows, term::split(16).1);
     }
 
+    #[ignore = "needs a pseudo-terminal"]
     #[test]
     fn the_conversation_stays_alive_above_the_editor() {
         let mut app = fixture();
@@ -3436,6 +3449,7 @@ pub mod tests {
         until_screen(&mut app, "arrived while editing");
     }
 
+    #[ignore = "needs a pseudo-terminal"]
     #[test]
     fn keys_go_to_the_editor_and_its_result_lands_in_the_input_line() {
         let (mut app, mut rx) = fixture_rx();
@@ -3482,6 +3496,7 @@ pub mod tests {
         assert_eq!(app.mode(), "NORMAL");
     }
 
+    #[ignore = "needs a pseudo-terminal"]
     #[test]
     fn a_failing_editor_says_so_and_a_normal_mode_start_is_undone() {
         let (mut app, mut rx) = fixture_rx();
@@ -3510,6 +3525,7 @@ pub mod tests {
         assert_eq!(app.mode(), "SEARCH");
     }
 
+    #[ignore = "needs a pseudo-terminal"]
     #[test]
     fn a_pasted_text_goes_to_the_editor_not_to_the_line() {
         let mut app = fixture();
@@ -3519,6 +3535,7 @@ pub mod tests {
         assert_eq!(app.compose.as_ref().unwrap().line.text(), "");
     }
 
+    #[ignore = "needs a local socket"]
     #[tokio::test]
     async fn a_message_written_in_the_editor_is_sent_with_its_line_breaks() {
         let (mut app, _rx, server) = writing().await;
@@ -3570,6 +3587,7 @@ pub mod tests {
             .collect()
     }
 
+    #[ignore = "needs a local socket"]
     #[tokio::test]
     async fn the_picker_adds_a_reaction_and_the_same_key_again_removes_it() {
         let (mut app, mut rx, server) = writing().await;
@@ -3726,6 +3744,7 @@ pub mod tests {
         assert!(row.contains("│") || row.width() <= 100, "{row}");
     }
 
+    #[ignore = "needs a local socket"]
     #[tokio::test]
     async fn m_fetches_the_members_and_their_statuses() {
         let (mut app, mut rx, server) = writing().await;
@@ -3827,6 +3846,7 @@ pub mod tests {
         assert_eq!(app.mode(), "NORMAL");
     }
 
+    #[ignore = "needs a local socket"]
     #[tokio::test]
     async fn an_attachment_is_downloaded_privately_and_opened_by_its_kind() {
         use wiremock::matchers::{method, path};
@@ -3872,6 +3892,7 @@ pub mod tests {
         assert!(!folder.exists());
     }
 
+    #[ignore = "needs a local socket"]
     #[tokio::test]
     async fn a_text_attachment_opens_in_the_pane_and_the_pane_closes_when_it_ends() {
         use wiremock::matchers::{method, path};

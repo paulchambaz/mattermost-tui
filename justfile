@@ -8,7 +8,7 @@ build:
   cargo build --release
 
 test:
-  cargo test --all-targets
+  cargo test --all-targets -- --include-ignored
 
 watch-test:
   cargo watch -x test

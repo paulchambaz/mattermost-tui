@@ -542,6 +542,7 @@ mod tests {
             )
     }
 
+    #[ignore = "needs a local socket"]
     #[tokio::test]
     async fn login_takes_token_from_header() {
         let server = MockServer::start().await;
@@ -553,6 +554,7 @@ mod tests {
         assert_eq!(client.me().await.unwrap().username, "paul");
     }
 
+    #[ignore = "needs a local socket"]
     #[tokio::test]
     async fn mfa_is_reported() {
         let server = MockServer::start().await;
@@ -569,6 +571,7 @@ mod tests {
         assert!(matches!(err, Error::MfaRequired));
     }
 
+    #[ignore = "needs a local socket"]
     #[tokio::test]
     async fn bad_password_is_refused() {
         let server = MockServer::start().await;
@@ -585,6 +588,7 @@ mod tests {
         assert!(matches!(err, Error::Login(_)));
     }
 
+    #[ignore = "needs a local socket"]
     #[tokio::test]
     async fn expired_session_logs_in_again() {
         let server = MockServer::start().await;
@@ -602,6 +606,7 @@ mod tests {
         assert_eq!(client.me().await.unwrap().username, "paul");
     }
 
+    #[ignore = "needs a local socket"]
     #[tokio::test]
     async fn second_rejection_is_an_error() {
         let server = MockServer::start().await;
@@ -619,6 +624,7 @@ mod tests {
         ));
     }
 
+    #[ignore = "needs a local socket"]
     #[tokio::test]
     async fn token_is_used_without_login() {
         let server = MockServer::start().await;
@@ -629,6 +635,7 @@ mod tests {
         assert_eq!(client.me().await.unwrap().id, UserId("u1".into()));
     }
 
+    #[ignore = "needs a local socket"]
     #[tokio::test]
     async fn view_sends_the_channel_and_the_previous_one() {
         let server = MockServer::start().await;
@@ -653,6 +660,7 @@ mod tests {
             .unwrap();
     }
 
+    #[ignore = "needs a local socket"]
     #[tokio::test]
     async fn posts_ask_for_the_page_before_a_post() {
         let server = MockServer::start().await;
@@ -681,6 +689,7 @@ mod tests {
         serde_json::json!({"id": id, "create_at": 1, "user_id": "u1", "channel_id": "c1", "message": "hi"})
     }
 
+    #[ignore = "needs a local socket"]
     #[tokio::test]
     async fn writing_calls_send_the_documented_bodies() {
         use wiremock::matchers::body_json;
@@ -731,6 +740,7 @@ mod tests {
         client.delete_post(&PostId("p1".into())).await.unwrap();
     }
 
+    #[ignore = "needs a local socket"]
     #[tokio::test]
     async fn reactions_and_presence_calls_send_the_documented_requests() {
         use wiremock::matchers::{body_json, query_param};
@@ -789,6 +799,7 @@ mod tests {
         assert_eq!(statuses[0].status, "away");
     }
 
+    #[ignore = "needs a local socket"]
     #[tokio::test]
     async fn users_posts_ids() {
         let server = MockServer::start().await;
@@ -807,6 +818,7 @@ mod tests {
         assert_eq!(users[0].username, "ana");
     }
 
+    #[ignore = "needs a local socket"]
     #[tokio::test]
     async fn a_file_comes_down_as_bytes() {
         let server = MockServer::start().await;

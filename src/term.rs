@@ -495,6 +495,7 @@ mod tests {
         lock(&pane.parser).screen().contents()
     }
 
+    #[ignore = "needs a pseudo-terminal"]
     #[test]
     fn what_the_editor_prints_lands_on_the_screen_with_its_colors() {
         let (pane, rx, _dir) = run("printf 'hello \\033[1;31mred\\033[0m\\nbye'", "");
@@ -507,6 +508,7 @@ mod tests {
         assert_eq!(cell.fgcolor(), vt100::Color::Idx(1));
     }
 
+    #[ignore = "needs a pseudo-terminal"]
     #[test]
     fn typed_keys_reach_the_editor_and_what_it_saves_comes_back() {
         let (mut pane, rx, _dir) = run(
@@ -520,6 +522,7 @@ mod tests {
         assert_eq!(pane.finish().unwrap(), "hi");
     }
 
+    #[ignore = "needs a pseudo-terminal"]
     #[test]
     fn the_editor_starts_on_the_text_in_a_private_file_that_is_removed_after() {
         let (pane, rx, _dir) = run("stat -c %a \"$1\"; cat \"$1\" > /dev/null", "start");
@@ -531,6 +534,7 @@ mod tests {
         assert!(!file.exists());
     }
 
+    #[ignore = "needs a pseudo-terminal"]
     #[test]
     fn a_failing_editor_is_an_error_and_a_missing_one_cannot_start() {
         let (pane, rx, _dir) = run("exit 3", "x");
@@ -545,6 +549,7 @@ mod tests {
         assert!(missing.finish().is_err());
     }
 
+    #[ignore = "needs a pseudo-terminal"]
     #[test]
     fn dropping_a_running_editor_kills_it_and_removes_the_file() {
         let (pane, _rx, _dir) = run("sleep 30", "x");
@@ -555,6 +560,7 @@ mod tests {
         assert!(!file.exists());
     }
 
+    #[ignore = "needs a pseudo-terminal"]
     #[test]
     fn a_resize_reaches_the_editor_and_its_screen() {
         let (mut pane, rx, _dir) = run("sleep 1\nstty size", "");
@@ -565,6 +571,7 @@ mod tests {
         assert!(contents(&pane).contains("6 30"), "{}", contents(&pane));
     }
 
+    #[ignore = "needs a pseudo-terminal"]
     #[test]
     fn a_paste_is_marked_only_when_the_editor_asked_for_it() {
         let (mut pane, rx, _dir) = run(
@@ -588,6 +595,7 @@ mod tests {
         fs::read(&pane.file).unwrap()
     }
 
+    #[ignore = "needs a pseudo-terminal"]
     #[test]
     fn the_editor_gets_the_answers_to_its_questions_about_the_terminal() {
         assert_eq!(reply_to("\\033[c", 9), b"\x1b[?62;22c");
@@ -605,6 +613,7 @@ mod tests {
         );
     }
 
+    #[ignore = "needs a pseudo-terminal"]
     #[test]
     fn a_viewer_shows_a_file_and_leaves_it_alone() {
         let dir = tempfile::tempdir().unwrap();

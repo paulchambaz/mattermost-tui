@@ -735,6 +735,7 @@ mod tests {
         assert_eq!(app.notice, "No server matches nobody");
     }
 
+    #[ignore = "needs a local socket"]
     #[tokio::test]
     async fn mark_all_read_views_each_unread_channel_once_and_writes_nothing_else() {
         let (mut app, server) = live().await;
@@ -817,6 +818,7 @@ mod tests {
         (app, rx, server)
     }
 
+    #[ignore = "needs a local socket"]
     #[tokio::test]
     async fn server_commands_send_exactly_their_requests() {
         let (mut app, mut rx, server) = commanding().await;
