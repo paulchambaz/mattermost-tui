@@ -2,6 +2,7 @@
 
 mod api;
 mod app;
+mod clipboard;
 mod config;
 mod debug;
 mod finder;
@@ -11,6 +12,8 @@ mod term;
 mod ui;
 mod unread;
 mod ws;
+
+use std::io::Write;
 
 use anyhow::Result;
 use app::{App, Msg};
@@ -70,6 +73,12 @@ async fn run(
         app.update(msg);
         while let Ok(msg) = rx.try_recv() {
             app.update(msg);
+        }
+        for sequence in app.clipboard.drain(..) {
+            let mut out = std::io::stdout();
+            let _ = out
+                .write_all(sequence.as_bytes())
+                .and_then(|()| out.flush());
         }
     }
     Ok(())

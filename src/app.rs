@@ -10,10 +10,11 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
 use crate::api::types::{
-    CategoryList, Channel, ChannelId, ChannelMember, Post, PostId, PostList, Team as WireTeam,
-    TeamId, User, UserId,
+    CategoryList, Channel, ChannelId, ChannelMember, Post, PostId, PostList, Reaction, Status,
+    Team as WireTeam, TeamId, User, UserId, UserStatus,
 };
 use crate::api::{Client, Error};
+use crate::clipboard;
 use crate::config::{self, Credentials, ServerConfig};
 use crate::debug;
 use crate::finder;
@@ -59,6 +60,13 @@ pub enum Loaded {
         asked: usize,
     },
     Users(Vec<User>),
+    Members {
+        channel: ChannelId,
+        users: Vec<User>,
+        statuses: Vec<UserStatus>,
+    },
+    Reacted(Reaction),
+    Unreacted(Reaction),
     Created(Post),
     Edited(Post),
     Deleted {
@@ -72,6 +80,30 @@ pub enum Loaded {
     },
     Viewed,
     Failed(String),
+}
+
+/// The reactions of the picker, chosen with the keys 1 to 9.
+pub const REACTIONS: [&str; 9] = [
+    "+1",
+    "heart",
+    "joy",
+    "tada",
+    "eyes",
+    "fire",
+    "skull",
+    "ok_hand",
+    "open_mouth",
+];
+
+/// The narrowest terminal that has room for the users column.
+const MIN_WIDTH_FOR_USERS: u16 = 70;
+
+/// The users column: whether it is shown, has the focus, and how far it is scrolled.
+#[derive(Debug, Default)]
+pub struct Users {
+    pub shown: bool,
+    pub focus: bool,
+    pub top: usize,
 }
 
 /// The channel finder: what is being typed and which match is chosen.
@@ -111,6 +143,7 @@ struct Target {
     author: String,
     own: bool,
     system: bool,
+    mine: Vec<String>,
 }
 
 /// What entering a channel should put under the cursor.
@@ -157,6 +190,13 @@ pub struct App {
     pub wizard: Option<Wizard>,
     pub help: Option<usize>,
     pub finder: Option<Finder>,
+    pub picker: bool,
+    pub selecting: bool,
+    anchor: usize,
+    register: String,
+    last_reaction: Option<&'static str>,
+    pub clipboard: Vec<String>,
+    pub users: Users,
     pub compose: Option<Compose>,
     pub pane: Option<Pane>,
     pub size: (u16, u16),
@@ -194,6 +234,13 @@ impl App {
             wizard: None,
             help: None,
             finder: None,
+            picker: false,
+            selecting: false,
+            anchor: 0,
+            register: String::new(),
+            last_reaction: None,
+            clipboard: Vec::new(),
+            users: Users::default(),
             compose: None,
             pane: None,
             size: (80, 24),
@@ -250,6 +297,9 @@ impl App {
             (Some(_), ..) => "COMMAND",
             (.., Some(_)) => "SEARCH",
             (_, _, Some(_), _) => "HELP",
+            _ if self.picker => "REACT",
+            _ if self.users.focus => "USERS",
+            _ if self.selecting => "VISUAL",
             _ => "NORMAL",
         }
     }
@@ -298,6 +348,8 @@ impl App {
             }
         } else if key.code == KeyCode::Char('g') && ctrl && (plain || self.compose.is_some()) {
             self.open_editor();
+        } else if self.picker {
+            self.picker_key(key);
         } else if self.compose.is_some() {
             self.compose_key(key);
         } else if self.finder.is_some() {
@@ -313,6 +365,13 @@ impl App {
     }
 
     fn normal_key(&mut self, key: KeyEvent) {
+        if self.users.focus {
+            return self.users_key(key);
+        }
+        if key.code == KeyCode::Esc {
+            self.selecting = false;
+            return;
+        }
         let KeyCode::Char(c) = key.code else {
             return;
         };
@@ -334,6 +393,13 @@ impl App {
             'n' => self.next_unread(),
             'N' => self.next_mention(),
             'c' => self.mark_read(),
+            'x' => self.open_picker(),
+            'X' => self.repeat_reaction(),
+            'y' => self.yank(false),
+            'Y' => self.yank(true),
+            'p' => self.paste_register(),
+            'V' => self.toggle_selection(),
+            'm' => self.toggle_users(),
             'i' => self.start_compose(Kind::Message, None),
             'r' => self.reply(),
             'e' => self.edit(),
@@ -365,6 +431,12 @@ impl App {
             author: server.username(&message.user).to_owned(),
             own: server.me.as_ref().is_some_and(|m| m.id == message.user),
             system: message.system,
+            mine: message
+                .reactions
+                .iter()
+                .filter(|g| server.me.as_ref().is_some_and(|m| g.users.contains(&m.id)))
+                .map(|g| g.name.clone())
+                .collect(),
         })
     }
 
@@ -642,6 +714,209 @@ impl App {
         }
     }
 
+    /// Whether message `i` is shown as selected: the cursor, or the range being selected.
+    pub fn is_selected(&self, i: usize) -> bool {
+        let (low, high) = match self.selecting {
+            true => (self.anchor.min(self.cursor), self.anchor.max(self.cursor)),
+            false => (self.cursor, self.cursor),
+        };
+        self.browsing && (low..=high).contains(&i)
+    }
+
+    fn toggle_selection(&mut self) {
+        if self.count() == 0 {
+            return;
+        }
+        self.selecting = !self.selecting;
+        self.anchor = self.cursor;
+        self.browsing = true;
+    }
+
+    fn yank(&mut self, quote: bool) {
+        let (Some((server, _)), Some(messages)) = (self.channel(), self.messages()) else {
+            return;
+        };
+        if messages.is_empty() {
+            return;
+        }
+        let last = messages.len() - 1;
+        let (low, high) = match self.selecting {
+            true => (self.anchor.min(self.cursor), self.anchor.max(self.cursor)),
+            false => (self.cursor, self.cursor),
+        };
+        let chosen = &messages[low.min(last)..=high.min(last)];
+        let lines: Vec<String> = chosen
+            .iter()
+            .map(|m| match quote {
+                true => format!(
+                    "[{}] {}: {}",
+                    m.at.format("%H:%M"),
+                    server.username(&m.user),
+                    m.text
+                ),
+                false => m.text.clone(),
+            })
+            .collect();
+        let count = lines.len();
+        self.register = lines.join("\n");
+        self.clipboard.push(clipboard::osc52(&self.register));
+        self.selecting = false;
+        self.browsing = true;
+        self.notice = match count {
+            1 => "Copied 1 message".into(),
+            n => format!("Copied {n} messages"),
+        };
+    }
+
+    fn paste_register(&mut self) {
+        if self.register.is_empty() {
+            self.notice = "Nothing to paste: copy a message with y first".into();
+            return;
+        }
+        if self.compose.is_none() {
+            self.start_compose(Kind::Message, None);
+        }
+        if let Some(compose) = &mut self.compose {
+            compose.line.insert_str(&self.register);
+            self.ping_typing();
+        }
+    }
+
+    fn open_picker(&mut self) {
+        if self.target().is_some() {
+            self.browsing = true;
+            self.picker = true;
+        }
+    }
+
+    fn picker_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char(c @ '1'..='9') => {
+                self.picker = false;
+                self.react(REACTIONS[usize::from(c as u8 - b'1')]);
+            }
+            KeyCode::Esc | KeyCode::Char('x' | 'q') => self.picker = false,
+            _ => {}
+        }
+    }
+
+    fn repeat_reaction(&mut self) {
+        match self.last_reaction {
+            Some(name) => self.react(name),
+            None => self.notice = "No recent reaction: pick one with x".into(),
+        }
+    }
+
+    fn react(&mut self, name: &'static str) {
+        let Some(target) = self.target() else {
+            return;
+        };
+        let Some((server, _)) = self.channel() else {
+            return;
+        };
+        let (Some(client), Some(me)) = (
+            server.client.clone(),
+            server.me.as_ref().map(|m| m.id.clone()),
+        ) else {
+            self.notice = "Not connected".into();
+            return;
+        };
+        self.browsing = true;
+        self.last_reaction = Some(name);
+        let post = target.id;
+        let had = target.mine.iter().any(|n| n == name);
+        self.spawn(self.server, async move {
+            let done = match had {
+                true => client.unreact(&me, &post, name).await.map(|()| {
+                    Loaded::Unreacted(Reaction {
+                        user_id: me.clone(),
+                        post_id: post.clone(),
+                        emoji_name: name.into(),
+                    })
+                }),
+                false => client.react(&me, &post, name).await.map(Loaded::Reacted),
+            };
+            done.unwrap_or_else(|e| Loaded::Failed(e.to_string()))
+        });
+    }
+
+    fn toggle_users(&mut self) {
+        match (self.users.shown, self.users.focus) {
+            (false, _) if self.size.0 < MIN_WIDTH_FOR_USERS => {
+                self.notice = "Screen too narrow for the users list".into();
+            }
+            (false, _) => {
+                self.users = Users {
+                    shown: true,
+                    focus: true,
+                    top: 0,
+                };
+                if let Some(id) = self.channel().map(|(_, c)| c.info.id.clone()) {
+                    if let Some(server) = self.servers.get_mut(self.server) {
+                        server.members.remove(&id);
+                        server.members_loading.remove(&id);
+                    }
+                }
+                self.ensure_members();
+            }
+            (true, false) => self.users.focus = true,
+            (true, true) => self.users = Users::default(),
+        }
+    }
+
+    fn users_key(&mut self, key: KeyEvent) {
+        let users = &mut self.users;
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => users.focus = false,
+            KeyCode::Char('m') => *users = Users::default(),
+            KeyCode::Char('j') | KeyCode::Down => users.top += 1,
+            KeyCode::Char('k') | KeyCode::Up => users.top = users.top.saturating_sub(1),
+            KeyCode::PageDown => users.top += 10,
+            KeyCode::PageUp => users.top = users.top.saturating_sub(10),
+            KeyCode::Char('g') | KeyCode::Home => users.top = 0,
+            KeyCode::Char('G') | KeyCode::End => users.top = usize::MAX / 2,
+            _ => {}
+        }
+    }
+
+    fn ensure_members(&mut self) {
+        if !self.users.shown {
+            return;
+        }
+        let Some((server, chan)) = self.channel() else {
+            return;
+        };
+        let id = chan.info.id.clone();
+        let Some(client) = server
+            .client
+            .clone()
+            .filter(|_| !server.members.contains_key(&id))
+        else {
+            return;
+        };
+        let i = self.server;
+        let Some(server) = self.servers.get_mut(i) else {
+            return;
+        };
+        if !server.members_loading.insert(id.clone()) {
+            return;
+        }
+        self.spawn(i, async move {
+            match client.channel_users(&id).await {
+                Ok(users) => {
+                    let ids: Vec<UserId> = users.iter().map(|u| u.id.clone()).collect();
+                    let statuses = client.statuses(&ids).await.unwrap_or_default();
+                    Loaded::Members {
+                        channel: id,
+                        users,
+                        statuses,
+                    }
+                }
+                Err(e) => Loaded::Failed(e.to_string()),
+            }
+        });
+    }
+
     /// The (server, team, channel) of every match of the finder, best first.
     fn finder_targets(&self) -> Vec<(usize, usize, usize)> {
         let Some(finder) = &self.finder else {
@@ -805,6 +1080,7 @@ impl App {
     }
 
     fn reset_view(&mut self) {
+        self.selecting = false;
         self.cursor = self.count().saturating_sub(1);
         self.browsing = false;
         self.follow = false;
@@ -875,7 +1151,7 @@ impl App {
     fn step_down(&mut self) {
         match (self.browsing, self.cursor + 1 >= self.count()) {
             (false, _) => {}
-            (true, true) => self.browsing = false,
+            (true, true) => self.browsing = self.selecting,
             (true, false) => self.move_cursor(self.cursor + 1),
         }
     }
@@ -959,6 +1235,16 @@ impl App {
                 return self.apply_event(i, Event::Posted { post, mentions });
             }
             Loaded::Edited(post) => return self.apply_event(i, Event::Edited(post)),
+            Loaded::Reacted(reaction) => {
+                let glyph = crate::ui::emoji(&format!(":{}:", reaction.emoji_name));
+                self.notice = format!("Reacted {glyph}");
+                return self.apply_event(i, Event::ReactionAdded(reaction));
+            }
+            Loaded::Unreacted(reaction) => {
+                let glyph = crate::ui::emoji(&format!(":{}:", reaction.emoji_name));
+                self.notice = format!("Removed {glyph}");
+                return self.apply_event(i, Event::ReactionRemoved(reaction));
+            }
             Loaded::Deleted { channel, id } => {
                 let post = Post {
                     id,
@@ -1123,9 +1409,28 @@ impl App {
             }
             Loaded::Created(_)
             | Loaded::Edited(_)
+            | Loaded::Reacted(_)
+            | Loaded::Unreacted(_)
             | Loaded::Deleted { .. }
             | Loaded::NotSent { .. }
             | Loaded::Viewed => {}
+            Loaded::Members {
+                channel,
+                users,
+                statuses,
+            } => {
+                server.members_loading.remove(&channel);
+                let ids = users.iter().map(|u| u.id.clone()).collect();
+                server
+                    .users
+                    .extend(users.into_iter().map(|u| (u.id.clone(), u)));
+                for entry in statuses {
+                    server
+                        .status
+                        .insert(entry.user_id, Status::parse(&entry.status));
+                }
+                server.members.insert(channel, ids);
+            }
             Loaded::Users(users) => {
                 server
                     .users
@@ -1169,10 +1474,13 @@ impl App {
         };
         server.messages.retain(|id, _| Some(id) == current.as_ref());
         server.complete.retain(|id| Some(id) == current.as_ref());
+        server.members.clear();
+        server.members_loading.clear();
         self.refresh_channels(i);
         if let Some(id) = current {
             self.fetch_posts(i, id);
         }
+        self.ensure_members();
     }
 
     fn refresh_channels(&self, i: usize) {
@@ -1264,6 +1572,9 @@ impl App {
                     .for_each(|l| model::unreact(l, &reaction));
             }
             Event::Viewed(channel) => server.mark_viewed(&channel),
+            Event::Status { user, status } => {
+                server.status.insert(user, status);
+            }
             Event::Typing { channel, user } => {
                 if me.as_ref() != Some(&user) {
                     server.typed(&channel, &user, Instant::now());
@@ -1642,9 +1953,10 @@ pub mod tests {
     use tokio::sync::mpsc::unbounded_channel;
 
     use super::*;
-    use crate::api::types::{Post, PostList, Reaction};
+    use crate::api::types::{Post, PostList, Reaction, Status};
     use crate::api::Client;
     use crate::ui::tests::screen;
+    use unicode_width::UnicodeWidthStr;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent {
@@ -2136,13 +2448,17 @@ pub mod tests {
     #[tokio::test]
     async fn a_whole_session_only_reads_and_views() {
         let (mut app, server) = live().await;
-        press(&mut app, "JnNcKjkgGwb?qkkgg");
+        press(&mut app, "JnNcKjkgGwb?qkkggmjjm");
         posted(
             &mut app,
             post("p40", "c1", "u2", "@paul hi", 1_700_000_900_000),
             &["u1"],
         );
-        let allowed = ["/api/v4/users/ids", "/api/v4/channels/members/me/view"];
+        let allowed = [
+            "/api/v4/users/ids",
+            "/api/v4/users/status/ids",
+            "/api/v4/channels/members/me/view",
+        ];
         for (method, path, _) in sent(&server).await {
             assert!(
                 method == "GET" || (method == "POST" && allowed.contains(&path.as_str())),
@@ -2486,6 +2802,27 @@ pub mod tests {
             )))
             .mount(&server)
             .await;
+        let reaction = serde_json::json!({"user_id": "u1", "post_id": "p2", "emoji_name": "heart"});
+        Mock::given(method("POST"))
+            .and(path("/api/v4/reactions"))
+            .respond_with(reply(reaction))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v4/users"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": "u1", "username": "paul"}, {"id": "u2", "username": "ana"}
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/users/status/ids"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!([{"user_id": "u2", "status": "online"}])),
+            )
+            .mount(&server)
+            .await;
         Mock::given(method("PUT"))
             .and(path("/api/v4/posts/p1/patch"))
             .respond_with(reply(new_post(
@@ -2527,7 +2864,12 @@ pub mod tests {
 
     fn writes(sent: &[(String, String, String)]) -> Vec<(String, String)> {
         sent.iter()
-            .filter(|(m, p, _)| m != "GET" && !p.ends_with("/view") && !p.ends_with("/users/ids"))
+            .filter(|(m, p, _)| {
+                m != "GET"
+                    && !p.ends_with("/view")
+                    && !p.ends_with("/users/ids")
+                    && !p.ends_with("/status/ids")
+            })
             .map(|(m, p, b)| (format!("{m} {p}"), b.clone()))
             .collect()
     }
@@ -2758,10 +3100,15 @@ pub mod tests {
         press_code(&mut app, KeyCode::Enter);
         press(&mut app, "dy");
         settle(&mut app, &mut rx, |a| a.count() < 3).await;
+        app.cursor = app.count() - 1;
+        press(&mut app, "x2");
+        press(&mut app, "X");
         let allowed = [
             "POST /api/v4/posts",
             "PUT /api/v4/posts/p1/patch",
             "DELETE /api/v4/posts/p1",
+            "POST /api/v4/reactions",
+            "DELETE /api/v4/users/u1/posts/p2/reactions/heart",
         ];
         for (request, _) in writes(&sent(&server).await) {
             assert!(allowed.contains(&request.as_str()), "{request}");
@@ -2990,5 +3337,193 @@ pub mod tests {
             .position(|l| l.contains("new messages"))
             .unwrap();
         assert!(lines[at + 1].contains("hi"), "{shown}");
+    }
+
+    fn last_reactions(app: &App) -> Vec<(String, usize)> {
+        let list = app.messages().unwrap();
+        list[list.len() - 1]
+            .reactions
+            .iter()
+            .map(|g| (g.name.clone(), g.users.len()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_picker_adds_a_reaction_and_the_same_key_again_removes_it() {
+        let (mut app, mut rx, server) = writing().await;
+        press(&mut app, "x");
+        assert_eq!(app.mode(), "REACT");
+        press(&mut app, "z");
+        assert_eq!(app.mode(), "REACT");
+        press(&mut app, "2");
+        assert_eq!(app.mode(), "NORMAL");
+        settle(&mut app, &mut rx, |a| {
+            last_reactions(a).iter().any(|r| r.0 == "heart")
+        })
+        .await;
+        assert_eq!(app.notice, "Reacted ❤️");
+        press(&mut app, "x2");
+        settle(&mut app, &mut rx, |a| {
+            !last_reactions(a).iter().any(|r| r.0 == "heart")
+        })
+        .await;
+        assert_eq!(app.notice, "Removed ❤️");
+        press(&mut app, "X");
+        settle(&mut app, &mut rx, |a| {
+            last_reactions(a).iter().any(|r| r.0 == "heart")
+        })
+        .await;
+        let sent = writes(&sent(&server).await);
+        let requests: Vec<&str> = sent.iter().map(|(r, _)| r.as_str()).collect();
+        assert_eq!(
+            requests,
+            [
+                "POST /api/v4/reactions",
+                "DELETE /api/v4/users/u1/posts/p2/reactions/heart",
+                "POST /api/v4/reactions"
+            ]
+        );
+        let body: serde_json::Value = serde_json::from_str(&sent[0].1).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"user_id": "u1", "post_id": "p2", "emoji_name": "heart"})
+        );
+    }
+
+    #[test]
+    fn the_picker_closes_on_esc_and_x_does_nothing_without_a_message_and_x_repeats_nothing_at_first(
+    ) {
+        let mut app = fixture();
+        press(&mut app, "x");
+        press_code(&mut app, KeyCode::Esc);
+        assert_eq!(app.mode(), "NORMAL");
+        press(&mut app, "X");
+        assert_eq!(app.notice, "No recent reaction: pick one with x");
+        press(&mut app, "J");
+        press(&mut app, "J");
+        press(&mut app, "x");
+        assert_eq!(app.mode(), "NORMAL");
+        let bottom = screen(&mut app, 80, 12).pop().unwrap();
+        assert!(!bottom.starts_with(" REACT"));
+    }
+
+    #[test]
+    fn y_and_capital_y_copy_a_message_or_a_range_through_the_register_and_the_clipboard() {
+        let mut app = fixture();
+        press(&mut app, "y");
+        assert_eq!(app.register, "hi");
+        assert_eq!(app.clipboard, [clipboard::osc52("hi")]);
+        assert_eq!(app.notice, "Copied 1 message");
+        let time = app.messages().unwrap()[1].at.format("%H:%M").to_string();
+        press(&mut app, "Y");
+        assert_eq!(app.register, format!("[{time}] ana: hi"));
+        (app.cursor, app.browsing) = (0, true);
+        press(&mut app, "Vj");
+        assert_eq!(app.mode(), "VISUAL");
+        press(&mut app, "y");
+        assert_eq!(app.register, "hello :tada:\nhi");
+        assert_eq!(app.notice, "Copied 2 messages");
+        assert_eq!(app.mode(), "NORMAL");
+        press(&mut app, "Vj");
+        press_code(&mut app, KeyCode::Esc);
+        assert_eq!(app.mode(), "NORMAL");
+    }
+
+    #[test]
+    fn p_puts_the_register_in_the_input_and_complains_when_it_is_empty() {
+        let mut app = fixture();
+        press(&mut app, "p");
+        assert_eq!(app.notice, "Nothing to paste: copy a message with y first");
+        assert!(app.compose.is_none());
+        (app.cursor, app.browsing) = (0, true);
+        press(&mut app, "Vjy");
+        press(&mut app, "p");
+        assert_eq!(app.mode(), "INSERT");
+        assert_eq!(
+            app.compose.as_ref().unwrap().line.text(),
+            "hello :tada:\nhi"
+        );
+    }
+
+    #[test]
+    fn m_shows_scrolls_unfocuses_and_hides_the_column_and_refuses_a_narrow_screen() {
+        let mut app = fixture();
+        screen(&mut app, 60, 14);
+        press(&mut app, "m");
+        assert_eq!(app.notice, "Screen too narrow for the users list");
+        assert!(!app.users.shown);
+        screen(&mut app, 100, 14);
+        press(&mut app, "m");
+        assert!(app.users.shown && app.users.focus);
+        assert_eq!(app.mode(), "USERS");
+        press(&mut app, "jj");
+        assert_eq!(app.users.top, 2);
+        press(&mut app, "q");
+        assert_eq!(app.mode(), "NORMAL");
+        assert!(app.users.shown && !app.quit);
+        press(&mut app, "mm");
+        assert!(!app.users.shown);
+    }
+
+    #[test]
+    fn the_column_lists_who_is_around_first_and_follows_status_events() {
+        let mut app = fixture();
+        let channel = ChannelId("c3".into());
+        screen(&mut app, 100, 14);
+        press(&mut app, "m");
+        app.servers[0].members.insert(
+            channel.clone(),
+            vec![UserId("u1".into()), UserId("u2".into())],
+        );
+        app.servers[0]
+            .status
+            .insert(UserId("u2".into()), Status::Online);
+        let shown = screen(&mut app, 100, 14).join("\n");
+        assert!(
+            shown.contains("present — 1") && shown.contains("● ana"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("absent — 1") && shown.contains("○ paul"),
+            "{shown}"
+        );
+        assert!(shown.contains("hello"), "{shown}");
+        app.apply_event(
+            0,
+            Event::Status {
+                user: UserId("u1".into()),
+                status: Status::Away,
+            },
+        );
+        let shown = screen(&mut app, 100, 14).join("\n");
+        assert!(
+            shown.contains("present — 2") && shown.contains("● paul"),
+            "{shown}"
+        );
+        let row = shown.lines().find(|l| l.contains("hello")).unwrap();
+        assert!(row.contains("│") || row.width() <= 100, "{row}");
+    }
+
+    #[tokio::test]
+    async fn m_fetches_the_members_and_their_statuses() {
+        let (mut app, mut rx, server) = writing().await;
+        screen(&mut app, 100, 14);
+        press(&mut app, "m");
+        settle(&mut app, &mut rx, |a| {
+            a.servers[0].members.contains_key(&ChannelId("c3".into()))
+        })
+        .await;
+        let shown = screen(&mut app, 100, 14).join("\n");
+        assert!(
+            shown.contains("● ana") && shown.contains("○ paul"),
+            "{shown}"
+        );
+        let requests = sent(&server).await;
+        assert!(requests.iter().any(|(m, p, _)| m == "GET"
+            && p.starts_with("/api/v4/users?")
+            && p.contains("in_channel=c3")));
+        assert!(requests
+            .iter()
+            .any(|(m, p, b)| m == "POST" && p == "/api/v4/users/status/ids" && b.contains("u2")));
     }
 }

@@ -1,6 +1,7 @@
 //! Mattermost REST client with automatic re-login.
 //!
-//! Everything it does is a read except `view`, `create_post`, `edit_post` and `delete_post`.
+//! Everything it does is a read except `view`, `create_post`, `edit_post`, `delete_post`,
+//! `react` and `unreact`.
 
 /// Wire types of the REST API.
 pub mod types;
@@ -14,8 +15,8 @@ use thiserror::Error;
 
 use crate::config::Credentials;
 use types::{
-    CategoryList, Channel, ChannelId, ChannelMember, Post, PostId, PostList, Team, TeamId, User,
-    UserId,
+    CategoryList, Channel, ChannelId, ChannelMember, Post, PostId, PostList, Reaction, Team,
+    TeamId, User, UserId, UserStatus,
 };
 
 /// Everything that can go wrong talking to a server.
@@ -202,6 +203,62 @@ impl Client {
         let path = format!("/posts/{}", id.0);
         let _: serde_json::Value = self.fetch(Method::DELETE, &path, &[], None::<&()>).await?;
         Ok(())
+    }
+
+    /// Adds the reader's reaction to a post.
+    ///
+    /// # Errors
+    /// Fails on network or server errors.
+    pub async fn react(
+        &self,
+        user: &UserId,
+        post: &PostId,
+        emoji: &str,
+    ) -> Result<Reaction, Error> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            user_id: &'a str,
+            post_id: &'a str,
+            emoji_name: &'a str,
+        }
+        let body = Body {
+            user_id: &user.0,
+            post_id: &post.0,
+            emoji_name: emoji,
+        };
+        self.fetch(Method::POST, "/reactions", &[], Some(&body))
+            .await
+    }
+
+    /// Takes the reader's reaction off a post.
+    ///
+    /// # Errors
+    /// Fails on network or server errors.
+    pub async fn unreact(&self, user: &UserId, post: &PostId, emoji: &str) -> Result<(), Error> {
+        let path = format!("/users/{}/posts/{}/reactions/{emoji}", user.0, post.0);
+        let _: serde_json::Value = self.fetch(Method::DELETE, &path, &[], None::<&()>).await?;
+        Ok(())
+    }
+
+    /// The first 200 members of a channel.
+    ///
+    /// # Errors
+    /// Fails on network or server errors.
+    pub async fn channel_users(&self, channel: &ChannelId) -> Result<Vec<User>, Error> {
+        let query = [
+            ("in_channel", channel.0.clone()),
+            ("per_page", "200".to_owned()),
+        ];
+        self.fetch(Method::GET, "/users", &query, None::<&()>).await
+    }
+
+    /// Whether each of the users is around.
+    ///
+    /// # Errors
+    /// Fails on network or server errors.
+    pub async fn statuses(&self, ids: &[UserId]) -> Result<Vec<UserStatus>, Error> {
+        self.fetch(Method::POST, "/users/status/ids", &[], Some(ids))
+            .await
     }
 
     /// Any read-only answer as it came, for the trace asked for with `MM_DEBUG`.
@@ -570,6 +627,64 @@ mod tests {
             .unwrap();
         client.edit_post(&PostId("p1".into()), "fix").await.unwrap();
         client.delete_post(&PostId("p1".into())).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reactions_and_presence_calls_send_the_documented_requests() {
+        use wiremock::matchers::{body_json, query_param};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/reactions"))
+            .and(body_json(
+                serde_json::json!({"user_id": "u1", "post_id": "p1", "emoji_name": "+1"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"user_id": "u1", "post_id": "p1", "emoji_name": "+1"}),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/api/v4/users/u1/posts/p1/reactions/+1"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"status": "OK"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v4/users"))
+            .and(query_param("in_channel", "c1"))
+            .and(query_param("per_page", "200"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!([{"id": "u2", "username": "ana"}])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/users/status/ids"))
+            .and(body_json(serde_json::json!(["u2"])))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!([{"user_id": "u2", "status": "away", "last_activity_at": 1}]),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = Client::connect(&server.uri(), Credentials::Token("t".into()), None)
+            .await
+            .unwrap();
+        let (me, post) = (UserId("u1".into()), PostId("p1".into()));
+        assert_eq!(
+            client.react(&me, &post, "+1").await.unwrap().emoji_name,
+            "+1"
+        );
+        client.unreact(&me, &post, "+1").await.unwrap();
+        let users = client.channel_users(&ChannelId("c1".into())).await.unwrap();
+        assert_eq!(users[0].username, "ana");
+        let statuses = client.statuses(&[UserId("u2".into())]).await.unwrap();
+        assert_eq!(statuses[0].status, "away");
     }
 
     #[tokio::test]

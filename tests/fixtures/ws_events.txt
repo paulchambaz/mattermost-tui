@@ -8,3 +8,4 @@ reply	{"status":"OK","seq_reply":1}
 typing	{"event":"typing","data":{"parent_id":"","user_id":"u2"},"broadcast":{"omit_users":null,"user_id":"","channel_id":"c1","team_id":""},"seq":2}
 bad_inner	{"event":"posted","data":{"post":"{not json"},"broadcast":{"omit_users":null,"user_id":"","channel_id":"c1","team_id":""},"seq":2}
 not_json	this is not json
+status	{"event":"status_change","data":{"status":"away","user_id":"u2"},"broadcast":{"omit_users":null,"user_id":"u2","channel_id":"","team_id":""},"seq":5}

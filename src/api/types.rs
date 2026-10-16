@@ -24,6 +24,35 @@ pub struct User {
     pub username: String,
 }
 
+/// Whether a user is around.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Status {
+    Online,
+    Away,
+    DoNotDisturb,
+    #[default]
+    Offline,
+}
+
+impl Status {
+    /// Reads the server's word for a status; anything unknown counts as offline.
+    pub fn parse(word: &str) -> Self {
+        match word {
+            "online" => Self::Online,
+            "away" => Self::Away,
+            "dnd" => Self::DoNotDisturb,
+            _ => Self::Offline,
+        }
+    }
+}
+
+/// The status of one user, as the server sends it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UserStatus {
+    pub user_id: UserId,
+    pub status: String,
+}
+
 /// A team the reader belongs to.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Team {

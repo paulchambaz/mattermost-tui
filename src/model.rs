@@ -8,7 +8,7 @@ use chrono::{DateTime, Datelike, Local, TimeZone};
 
 use crate::api::types::{
     CategoryList, Channel, ChannelId, ChannelKind, ChannelMember, Post, PostId, PostList, Reaction,
-    Team as WireTeam, User, UserId,
+    Status, Team as WireTeam, User, UserId,
 };
 use crate::api::Client;
 use crate::ws::Action;
@@ -317,6 +317,14 @@ pub enum Link {
     Down,
 }
 
+/// A member of a channel and whether they are around.
+#[derive(Debug)]
+pub struct Member<'a> {
+    pub user: &'a UserId,
+    pub name: &'a str,
+    pub status: Status,
+}
+
 /// The sign written before a channel name.
 pub fn glyph(kind: ChannelKind) -> char {
     match kind {
@@ -341,6 +349,9 @@ pub struct Server {
     pub complete: HashSet<ChannelId>,
     pub paging: HashSet<ChannelId>,
     pub typing: HashMap<ChannelId, Vec<(UserId, Instant)>>,
+    pub members: HashMap<ChannelId, Vec<UserId>>,
+    pub members_loading: HashSet<ChannelId>,
+    pub status: HashMap<UserId, Status>,
     pub actions: Option<tokio::sync::mpsc::UnboundedSender<Action>>,
     pub link: Link,
 }
@@ -361,6 +372,9 @@ impl Server {
             complete: HashSet::new(),
             paging: HashSet::new(),
             typing: HashMap::new(),
+            members: HashMap::new(),
+            members_loading: HashSet::new(),
+            status: HashMap::new(),
             actions: None,
             link: Link::Connecting,
         }
@@ -391,6 +405,26 @@ impl Server {
             },
             _ => name.clone(),
         }
+    }
+
+    /// The members of a channel who are around and those who are not, each by name.
+    pub fn presence(&self, channel: &ChannelId) -> (Vec<Member<'_>>, Vec<Member<'_>>) {
+        let ids = self.members.get(channel).into_iter().flatten();
+        let mut all: Vec<Member> = ids
+            .map(|user| Member {
+                user,
+                name: self.username(user),
+                status: self.status.get(user).copied().unwrap_or_default(),
+            })
+            .collect();
+        let rank = |status: Status| match status {
+            Status::Online => 0,
+            Status::Away => 1,
+            Status::DoNotDisturb => 2,
+            Status::Offline => 3,
+        };
+        all.sort_by_key(|m| (rank(m.status), m.name.to_lowercase()));
+        all.into_iter().partition(|m| m.status != Status::Offline)
     }
 
     /// Notes that a user is typing in a channel.
@@ -767,5 +801,45 @@ mod tests {
             .is_empty());
         server.stopped(&channel, &ana);
         assert!(server.typing_names(&channel, now).is_empty());
+    }
+
+    #[test]
+    fn members_are_listed_present_first_by_status_then_name() {
+        let mut server = Server::new("work".into());
+        let channel = ChannelId("c".into());
+        let names = [
+            ("u1", "zed", Status::Online),
+            ("u2", "bob", Status::Away),
+            ("u3", "amy", Status::Online),
+            ("u4", "eve", Status::DoNotDisturb),
+            ("u5", "dan", Status::Offline),
+            ("u6", "cat", Status::Offline),
+        ];
+        for (id, name, status) in names {
+            let user = UserId(id.into());
+            server.users.insert(
+                user.clone(),
+                User {
+                    id: user.clone(),
+                    username: name.into(),
+                },
+            );
+            server.status.insert(user.clone(), status);
+            server
+                .members
+                .entry(channel.clone())
+                .or_default()
+                .push(user);
+        }
+        server
+            .members
+            .get_mut(&channel)
+            .unwrap()
+            .push(UserId("u7".into()));
+        let (present, absent) = server.presence(&channel);
+        let name = |list: &[Member]| list.iter().map(|m| m.name.to_owned()).collect::<Vec<_>>();
+        assert_eq!(name(&present), ["amy", "zed", "bob", "eve"]);
+        assert_eq!(name(&absent), ["?", "cat", "dan"]);
+        assert!(server.presence(&ChannelId("none".into())).0.is_empty());
     }
 }

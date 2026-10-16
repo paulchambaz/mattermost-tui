@@ -13,7 +13,7 @@ use serde_json::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_tungstenite::tungstenite::{self, Message as Frame};
 
-use crate::api::types::{ChannelId, Post, PostId, Reaction, UserId};
+use crate::api::types::{ChannelId, Post, PostId, Reaction, Status, UserId};
 use crate::api::Client;
 
 const IDLE: Duration = Duration::from_secs(120);
@@ -41,6 +41,7 @@ pub enum Event {
     ReactionRemoved(Reaction),
     Viewed(ChannelId),
     Typing { channel: ChannelId, user: UserId },
+    Status { user: UserId, status: Status },
 }
 
 /// Something to tell the server over the open connection.
@@ -115,6 +116,10 @@ pub fn parse(text: &str) -> Option<Event> {
         "channel_viewed" => Some(Event::Viewed(ChannelId(
             data.get("channel_id")?.as_str()?.to_owned(),
         ))),
+        "status_change" => Some(Event::Status {
+            user: UserId(data.get("user_id")?.as_str()?.to_owned()),
+            status: Status::parse(data.get("status")?.as_str()?),
+        }),
         "typing" => Some(Event::Typing {
             channel: ChannelId(broadcast.get("channel_id")?.as_str()?.to_owned()),
             user: UserId(data.get("user_id")?.as_str()?.to_owned()),
@@ -269,6 +274,14 @@ mod tests {
             panic!("not typing");
         };
         assert_eq!((channel.0.as_str(), user.0.as_str()), ("c1", "u2"));
+    }
+
+    #[test]
+    fn a_status_change_names_the_user_and_the_new_status() {
+        let Some(Event::Status { user, status }) = parse(&frame("status")) else {
+            panic!("not a status");
+        };
+        assert_eq!((user.0.as_str(), status), ("u2", Status::Away));
     }
 
     #[test]

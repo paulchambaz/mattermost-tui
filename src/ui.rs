@@ -10,7 +10,8 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, Kind};
+use crate::api::types::Status;
+use crate::app::{App, Kind, REACTIONS};
 use crate::finder;
 use crate::model::{self, group_with_previous, Link, Message, Server};
 use crate::term;
@@ -19,6 +20,8 @@ const MARGIN: usize = 1;
 const TIME: usize = 5;
 const NICK: usize = 16;
 const MIN_TEXT: usize = 10;
+const USERS_WIDTH: u16 = 24;
+const USERS_MIN_WIDTH: u16 = 70;
 
 const BINDINGS: &[(&str, &str)] = &[
     (
@@ -47,6 +50,14 @@ const BINDINGS: &[(&str, &str)] = &[
     ("e", "edit your selected message"),
     ("d", "delete your selected message, y confirms"),
     ("a", "reactions under the messages"),
+    (
+        "x X",
+        "react to the selected message (x: pick 1-9, X: the same again)",
+    ),
+    ("V", "select a range of messages, j k extend it"),
+    ("y Y", "copy the message or range (Y: with author and time)"),
+    ("p", "paste what was copied into the input"),
+    ("m", "users column: scroll it with j k, m again hides it"),
     ("q", "quit"),
 ];
 
@@ -342,7 +353,7 @@ fn messages_log(
 
         let color = Color::Indexed(model::user_color(&message.user));
         let name = server.username(&message.user);
-        let selected = app.browsing && app.cursor == i;
+        let selected = app.is_selected(i);
         let nick = match (message.system, continuing, selected) {
             (true, _, _) => Span::raw(" ".repeat(cols.nick)),
             (_, _, true) => {
@@ -572,6 +583,74 @@ fn server_down(app: &App) -> bool {
         .is_some_and(|s| s.link == Link::Down)
 }
 
+/// The reactions of the picker, written on the status line.
+fn picker_line(width: usize) -> Line<'static> {
+    let line = Style::new().add_modifier(Modifier::REVERSED);
+    let mut spans = vec![Span::styled(" REACT ", line.add_modifier(Modifier::BOLD))];
+    for (i, name) in REACTIONS.iter().enumerate() {
+        let glyph = emoji(&format!(":{name}:"));
+        spans.push(Span::styled(" ", line));
+        spans.push(Span::styled(
+            (i + 1).to_string(),
+            line.add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        ));
+        spans.push(Span::styled(format!(" {glyph} "), line));
+    }
+    let used: usize = spans.iter().map(Span::width).sum();
+    spans.push(Span::styled(" ".repeat(width.saturating_sub(used)), line));
+    Line::from(spans)
+}
+
+/// The members of the open channel: who is around with a dot for their status, then who is not.
+fn users_column(app: &App, inner: usize) -> Vec<Line<'static>> {
+    let Some((server, chan)) = app.channel() else {
+        return Vec::new();
+    };
+    if !server.members.contains_key(&chan.info.id) {
+        return vec![Line::styled(" loading…", muted())];
+    }
+    let (present, absent) = server.presence(&chan.info.id);
+    let heading = |title: &str, count: usize| {
+        Line::styled(
+            format!(" {title} — {count}"),
+            muted().add_modifier(Modifier::BOLD),
+        )
+    };
+    let mut rows = vec![heading("present", present.len())];
+    for member in &present {
+        let dot = match member.status {
+            Status::Online => Color::Indexed(2),
+            Status::Away => Color::Indexed(3),
+            Status::DoNotDisturb => Color::Indexed(1),
+            Status::Offline => Color::Indexed(8),
+        };
+        let color = Color::Indexed(model::user_color(member.user));
+        rows.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled("●", Style::new().fg(dot)),
+            Span::raw(" "),
+            Span::styled(
+                truncate(member.name, inner.saturating_sub(3).max(1)),
+                Style::new().fg(color),
+            ),
+        ]));
+    }
+    rows.push(Line::default());
+    rows.push(heading("absent", absent.len()));
+    for member in &absent {
+        let name = truncate(&format!(" ○ {}", member.name), inner);
+        rows.push(Line::styled(name, muted()));
+    }
+    if server
+        .members
+        .get(&chan.info.id)
+        .is_some_and(|m| m.len() >= 200)
+    {
+        rows.push(Line::styled(" + more not listed", muted()));
+    }
+    rows
+}
+
 /// Text in `base`, with the characters at `hits` in `hl`.
 fn highlighted(text: &str, hits: &[usize], base: Style, hl: Style) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
@@ -776,6 +855,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     ])
     .areas(area);
     let height = usize::from(body.height);
+    let (body, side) = match app.users.shown && area.width >= USERS_MIN_WIDTH {
+        true => {
+            let [log, side] =
+                Layout::horizontal([Constraint::Min(1), Constraint::Length(USERS_WIDTH)])
+                    .areas(body);
+            (log, Some(side))
+        }
+        false => (body, None),
+    };
+    let log_width = usize::from(body.width);
 
     frame.render_widget(Paragraph::new(tabs_line(app, width)), tabs);
 
@@ -794,7 +883,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             .collect();
         frame.render_widget(Paragraph::new(page), body);
     } else {
-        let log = render_log(app, width);
+        let log = render_log(app, log_width);
         let bottom = log.lines.len().saturating_sub(height);
         let mut scroll = app.scroll.min(bottom);
         if app.follow {
@@ -815,6 +904,25 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         percent = (scroll * 100).checked_div(bottom).unwrap_or(100);
         let page: Vec<Line> = log.lines.into_iter().skip(scroll).take(height).collect();
         frame.render_widget(Paragraph::new(page), body);
+    }
+
+    if let Some(side) = side {
+        let rows = users_column(app, usize::from(USERS_WIDTH) - 1);
+        let top = app.users.top.min(rows.len().saturating_sub(height));
+        app.users.top = top;
+        let rule = if app.users.focus {
+            Color::Indexed(3)
+        } else {
+            Color::Indexed(8)
+        };
+        let lines: Vec<Line> = (0..height)
+            .map(|i| {
+                let mut spans = vec![Span::styled("│", Style::new().fg(rule))];
+                spans.extend(rows.get(top + i).cloned().unwrap_or_default().spans);
+                Line::from(spans)
+            })
+            .collect();
+        frame.render_widget(Paragraph::new(lines), side);
     }
 
     if let Some(pane) = &mut app.pane {
@@ -861,9 +969,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             input.y,
         ));
     }
-    let bottom = match app.finder {
-        Some(_) => wildmenu(app, width),
-        None => status_line(app, width, percent),
+    let bottom = match (&app.finder, app.picker) {
+        (Some(_), _) => wildmenu(app, width),
+        (None, true) => picker_line(width),
+        (None, false) => status_line(app, width, percent),
     };
     frame.render_widget(Paragraph::new(bottom), status);
 }
@@ -1045,7 +1154,7 @@ pub mod tests {
         assert!(lines[1].starts_with(" Help"));
         assert!(lines.iter().any(|l| l.contains("next / previous channel")));
         assert!(from_end(&lines, 1).starts_with(" HELP"));
-        press(&mut app, "jjjjjjjjjjjjjjjjjjjjjj");
+        press(&mut app, &"j".repeat(80));
         let lines = screen(&mut app, 60, 12);
         assert!(lines.iter().any(|l| l.contains("log in to another server")));
         press(&mut app, "?");
@@ -1147,5 +1256,19 @@ pub mod tests {
         press(&mut app, " and a much longer sentence that cannot fit");
         let row = from_end(&screen(&mut app, 40, 12), 2).to_owned();
         assert!(row.ends_with("cannot fit"), "{row:?}");
+    }
+
+    #[test]
+    fn the_picker_takes_the_status_line_and_a_range_shows_visual_mode() {
+        let mut app = fixture();
+        press(&mut app, "x");
+        let row = screen(&mut app, 80, 12).pop().unwrap();
+        assert!(row.starts_with(" REACT  1 👍"), "{row:?}");
+        assert!(row.contains("9 😮"), "{row:?}");
+        press(&mut app, "q");
+        press(&mut app, "kkVj");
+        let row = screen(&mut app, 80, 12).pop().unwrap();
+        assert!(row.starts_with(" VISUAL"), "{row:?}");
+        assert!(has_background(&mut app, 3) && has_background(&mut app, 4));
     }
 }
