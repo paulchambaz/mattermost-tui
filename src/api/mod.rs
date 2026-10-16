@@ -204,6 +204,14 @@ impl Client {
         Ok(())
     }
 
+    /// Any read-only answer as it came, for the trace asked for with `MM_DEBUG`.
+    ///
+    /// # Errors
+    /// Fails on network or server errors.
+    pub async fn inspect(&self, path: &str) -> Result<serde_json::Value, Error> {
+        self.fetch(Method::GET, path, &[], None::<&()>).await
+    }
+
     /// A page of posts, newest first, optionally those older than `before`.
     ///
     /// # Errors

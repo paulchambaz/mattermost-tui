@@ -229,14 +229,19 @@ pub struct Chan {
 }
 
 impl Chan {
-    /// Whether the tab should be marked: posts newer than the last view, or a mention in a muted channel.
+    /// How many posts the reader has not read, by the server's own counters.
+    pub fn unread_count(&self) -> usize {
+        let read = self.member.as_ref().map_or(i64::MAX, |m| m.msg_count);
+        usize::try_from(self.info.total_msg_count - read).unwrap_or(0)
+    }
+
+    /// Whether the tab should be marked: unread posts, or a mention in a muted channel.
     pub fn unread(&self) -> bool {
         let Some(member) = &self.member else {
             return false;
         };
         let muted = member.notify_props.mark_unread == "mention";
-        let newer = self.info.last_post_at > member.last_viewed_at;
-        self.mentions() || (!muted && newer)
+        self.mentions() || (!muted && self.unread_count() > 0)
     }
 
     /// Whether someone mentioned the reader since the last view.
@@ -430,7 +435,7 @@ impl Server {
             .flat_map(|t| t.chans.iter_mut().flatten());
         for Chan { info, member } in chans.filter(|c| &c.info.id == channel) {
             if let Some(member) = member {
-                member.last_viewed_at = member.last_viewed_at.max(info.last_post_at);
+                member.msg_count = member.msg_count.max(info.total_msg_count);
                 member.mention_count = 0;
             }
         }
@@ -483,13 +488,14 @@ mod tests {
             display_name: name.into(),
             name: name.into(),
             last_post_at: last,
+            total_msg_count: last,
             delete_at: 0,
         }
     }
 
-    fn member(id: &str, viewed: i64, mentions: i64, mark: &str) -> ChannelMember {
+    fn member(id: &str, read: i64, mentions: i64, mark: &str) -> ChannelMember {
         serde_json::from_value(serde_json::json!({
-            "channel_id": id, "last_viewed_at": viewed, "mention_count": mentions,
+            "channel_id": id, "msg_count": read, "mention_count": mentions,
             "notify_props": {"mark_unread": mark}
         }))
         .unwrap()
@@ -551,12 +557,15 @@ mod tests {
     }
 
     #[test]
-    fn unread_follows_timestamps_and_mutes() {
+    fn unread_follows_the_servers_counters_and_mutes() {
         assert!(chan(10, Some(member("c", 5, 0, "all"))).unread());
         assert!(!chan(5, Some(member("c", 5, 0, "all"))).unread());
         assert!(!chan(10, Some(member("c", 5, 0, "mention"))).unread());
         assert!(chan(10, Some(member("c", 5, 2, "mention"))).unread());
         assert!(!chan(10, None).unread());
+        assert_eq!(chan(10, Some(member("c", 7, 0, "all"))).unread_count(), 3);
+        assert_eq!(chan(10, Some(member("c", 12, 0, "all"))).unread_count(), 0);
+        assert_eq!(chan(10, None).unread_count(), 0);
     }
 
     #[test]

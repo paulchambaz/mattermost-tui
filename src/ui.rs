@@ -14,7 +14,6 @@ use crate::app::{App, Kind};
 use crate::finder;
 use crate::model::{self, group_with_previous, Link, Message, Server};
 use crate::term;
-use crate::unread;
 
 const MARGIN: usize = 1;
 const TIME: usize = 5;
@@ -314,7 +313,9 @@ fn messages_log(
     let cols = columns(width);
     let now = Local::now();
     let me = server.me.as_ref().map_or("", |u| u.username.as_str());
-    let unread_at = unread::first_unread(messages, app.unread_from());
+    let unread_at = app
+        .unread_boundary()
+        .and_then(|id| messages.iter().position(|m| &m.id == id));
     let indent = " ".repeat(MARGIN + cols.time + usize::from(cols.time > 0) + cols.nick + 2);
     let mut log = Log {
         lines: Vec::new(),

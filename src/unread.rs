@@ -3,12 +3,10 @@
 use crate::api::types::{ChannelKind, User};
 use crate::model::Message;
 
-/// Index of the first message newer than `from`, when it is not the first one shown.
-pub fn first_unread(messages: &[Message], from: i64) -> Option<usize> {
-    messages
-        .iter()
-        .position(|m| m.ms > from)
-        .filter(|&i| i > 0 && from > 0)
+/// Index of the first unread message when `unread` posts are unread, unless it is the first one shown.
+pub fn first_unread(messages: &[Message], unread: usize) -> Option<usize> {
+    let start = messages.len().saturating_sub(unread);
+    (unread > 0 && start > 0).then_some(start)
 }
 
 fn names_me(text: &str, me: &str) -> bool {
@@ -38,20 +36,20 @@ pub fn mentions_me(message: &Message, kind: ChannelKind, me: &User) -> bool {
     }
 }
 
-/// Index of the first message after `after` that is newer than `from` and calls the reader.
+/// Index of the first message from `start` on, and after `after`, that calls the reader.
 pub fn first_mention(
     messages: &[Message],
-    from: i64,
+    start: usize,
     after: Option<usize>,
     kind: ChannelKind,
     me: &User,
 ) -> Option<usize> {
-    let start = after.map_or(0, |a| a + 1);
+    let from = after.map_or(start, |a| (a + 1).max(start));
     messages
         .iter()
         .enumerate()
-        .skip(start)
-        .find(|(_, m)| m.ms > from && mentions_me(m, kind, me))
+        .skip(from)
+        .find(|(_, m)| mentions_me(m, kind, me))
         .map(|(i, _)| i)
 }
 
@@ -92,11 +90,12 @@ mod tests {
     }
 
     #[test]
-    fn the_separator_sits_before_the_first_newer_message() {
+    fn the_separator_sits_before_the_first_unread_post() {
         let list = [msg("a", "", 10), msg("a", "", 20), msg("a", "", 30)];
-        assert_eq!(first_unread(&list, 15), Some(1));
-        assert_eq!(first_unread(&list, 30), None);
-        assert_eq!(first_unread(&list, 5), None);
+        assert_eq!(first_unread(&list, 2), Some(1));
+        assert_eq!(first_unread(&list, 1), Some(2));
+        assert_eq!(first_unread(&list, 3), None);
+        assert_eq!(first_unread(&list, 40), None);
         assert_eq!(first_unread(&list, 0), None);
     }
 
@@ -151,10 +150,11 @@ mod tests {
             msg("u2", "@paul newer", 40),
         ];
         let kind = ChannelKind::Public;
-        assert_eq!(first_mention(&list, 15, None, kind, &me()), Some(2));
-        assert_eq!(first_mention(&list, 15, Some(2), kind, &me()), Some(3));
-        assert_eq!(first_mention(&list, 15, Some(3), kind, &me()), None);
+        assert_eq!(first_mention(&list, 1, None, kind, &me()), Some(2));
+        assert_eq!(first_mention(&list, 1, Some(2), kind, &me()), Some(3));
+        assert_eq!(first_mention(&list, 1, Some(3), kind, &me()), None);
         assert_eq!(first_mention(&list, 0, None, kind, &me()), Some(0));
+        assert_eq!(first_mention(&list, 0, Some(0), kind, &me()), Some(2));
     }
 
     #[test]

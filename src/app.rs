@@ -15,6 +15,7 @@ use crate::api::types::{
 };
 use crate::api::{Client, Error};
 use crate::config::{self, Credentials, ServerConfig};
+use crate::debug;
 use crate::finder;
 use crate::input::{self, Command, Line, Step, Wizard};
 use crate::model::{self, group_start, group_with_previous, Link, Message, Server, Team};
@@ -125,7 +126,8 @@ enum Goal {
 struct Entry {
     server: usize,
     channel: ChannelId,
-    from: i64,
+    unread: usize,
+    boundary: Option<PostId>,
     goal: Goal,
     placed: bool,
 }
@@ -1026,6 +1028,20 @@ impl App {
                 categories,
             } => {
                 let chans = model::order_channels(channels, members, categories.as_ref());
+                if debug::on() {
+                    for chan in &chans {
+                        let (total, read, mentions) = (
+                            chan.info.total_msg_count,
+                            chan.member.as_ref().map(|m| m.msg_count),
+                            chan.member.as_ref().map(|m| m.mention_count),
+                        );
+                        debug::log(&format!(
+                            "loaded {} total={total} read={read:?} mentions={mentions:?} unread={}",
+                            chan.info.id.0,
+                            chan.unread()
+                        ));
+                    }
+                }
                 let others: Vec<UserId> = chans
                     .iter()
                     .filter_map(|c| server.other_of(&c.info))
@@ -1187,6 +1203,10 @@ impl App {
                 let mine = me.as_ref() == Some(&post.user_id);
                 let mentioned = !mine && me.as_ref().is_some_and(|m| mentions.contains(m));
                 let mut known = false;
+                let fresh = server
+                    .messages
+                    .get(&channel)
+                    .is_none_or(|l| l.iter().all(|m| m.id != post.id));
                 let chans = server
                     .teams
                     .iter_mut()
@@ -1194,14 +1214,13 @@ impl App {
                 for chan in chans.filter(|c| c.info.id == channel) {
                     known = true;
                     chan.info.last_post_at = chan.info.last_post_at.max(post.create_at);
+                    if fresh {
+                        chan.info.total_msg_count += 1;
+                    }
                     if let (true, Some(member)) = (mentioned, chan.member.as_mut()) {
                         member.mention_count += 1;
                     }
                 }
-                let fresh = server
-                    .messages
-                    .get(&channel)
-                    .is_none_or(|l| l.iter().all(|m| m.id != post.id));
                 if fresh && (mine || current.as_ref() == Some(&channel)) {
                     server.mark_viewed(&channel);
                 }
@@ -1317,13 +1336,13 @@ impl App {
         let Some((_, chan)) = self.channel() else {
             return;
         };
-        let (id, from) = (
-            chan.info.id.clone(),
-            chan.member.as_ref().map_or(0, |m| m.last_viewed_at),
-        );
+        let (id, unread) = (chan.info.id.clone(), chan.unread_count());
         let same = |e: &Entry| e.server == self.server && e.channel == id;
         if self.entry.as_ref().is_some_and(same) {
             return;
+        }
+        if debug::on() {
+            debug::log(&format!("enter {} unread={unread}", id.0));
         }
         let old = self.entry.take();
         if let Some(e) = &old {
@@ -1336,7 +1355,8 @@ impl App {
         self.entry = Some(Entry {
             server: self.server,
             channel: id.clone(),
-            from,
+            unread,
+            boundary: None,
             goal,
             placed: false,
         });
@@ -1350,7 +1370,7 @@ impl App {
         let Some(entry) = self.entry.as_ref().filter(|e| !e.placed) else {
             return;
         };
-        let (from, goal) = (entry.from, entry.goal);
+        let (unread, goal) = (entry.unread, entry.goal);
         let Some((server, chan)) = self.channel() else {
             return;
         };
@@ -1358,13 +1378,20 @@ impl App {
         else {
             return;
         };
-        let mention = || unread::first_mention(messages, from, None, chan.info.kind, me);
-        let target = match goal {
-            Goal::Mention => mention().or_else(|| unread::first_unread(messages, from)),
-            Goal::Unread => unread::first_unread(messages, from),
+        let boundary = unread::first_unread(messages, unread);
+        let start = messages.len().saturating_sub(unread);
+        let mention = || {
+            let found = unread::first_mention(messages, start, None, chan.info.kind, me);
+            found.filter(|_| unread > 0)
         };
+        let target = match goal {
+            Goal::Mention => mention().or(boundary),
+            Goal::Unread => boundary,
+        };
+        let boundary = boundary.map(|i| messages[i].id.clone());
         if let Some(entry) = &mut self.entry {
             entry.placed = true;
+            entry.boundary = boundary;
         }
         match target {
             Some(index) => self.move_cursor(index),
@@ -1377,22 +1404,57 @@ impl App {
             return;
         };
         self.spawn(i, async move {
-            match client.view(&channel, prev.as_ref()).await {
+            let sent = client.view(&channel, prev.as_ref()).await;
+            if debug::on() {
+                let outcome = sent
+                    .as_ref()
+                    .map_or_else(ToString::to_string, |()| "ok".into());
+                let before = prev.as_ref().map(|p| p.0.as_str());
+                debug::log(&format!("view {} prev={before:?}: {outcome}", channel.0));
+                let info = client.inspect(&format!("/channels/{}", channel.0)).await;
+                let member = client
+                    .inspect(&format!("/channels/{}/members/me", channel.0))
+                    .await;
+                let (channel_keys, member_keys) = (
+                    ["last_post_at", "total_msg_count", "total_msg_count_root"],
+                    [
+                        "last_viewed_at",
+                        "msg_count",
+                        "msg_count_root",
+                        "mention_count",
+                    ],
+                );
+                debug::log(&format!(
+                    "  server now: {} | {}",
+                    debug::pick(&info, &channel_keys),
+                    debug::pick(&member, &member_keys)
+                ));
+            }
+            match sent {
                 Ok(()) => Loaded::Viewed,
                 Err(e) => Loaded::Failed(e.to_string()),
             }
         });
     }
 
-    /// Where the reader had read up to when the open channel was entered.
-    pub fn unread_from(&self) -> i64 {
-        self.entry.as_ref().map_or(0, |e| e.from)
+    /// The first post that was unread when the open channel was entered, unless it is the first shown.
+    pub fn unread_boundary(&self) -> Option<&PostId> {
+        self.entry.as_ref()?.boundary.as_ref()
+    }
+
+    fn unread_start(&self) -> Option<usize> {
+        let entry = self.entry.as_ref().filter(|e| e.unread > 0)?;
+        let messages = self.messages()?;
+        let boundary = entry.boundary.as_ref();
+        Some(
+            boundary
+                .and_then(|id| messages.iter().position(|m| &m.id == id))
+                .unwrap_or(0),
+        )
     }
 
     fn next_unread(&mut self) {
-        let first = self
-            .messages()
-            .and_then(|m| unread::first_unread(m, self.unread_from()));
+        let first = self.unread_start().filter(|&f| f > 0);
         if let Some(first) = first.filter(|&f| !self.browsing || self.cursor < f) {
             return self.move_cursor(first);
         }
@@ -1418,7 +1480,8 @@ impl App {
         let here = self.channel().and_then(|(server, chan)| {
             let (messages, me) = (server.messages.get(&chan.info.id)?, server.me.as_ref()?);
             let after = self.browsing.then_some(self.cursor);
-            unread::first_mention(messages, self.unread_from(), after, chan.info.kind, me)
+            let start = self.unread_start()?;
+            unread::first_mention(messages, start, after, chan.info.kind, me)
         });
         if let Some(index) = here {
             return self.move_cursor(index);
@@ -1452,9 +1515,10 @@ impl App {
         let Some((_, chan)) = self.channel() else {
             return;
         };
-        let (id, last_post) = (chan.info.id.clone(), chan.info.last_post_at);
+        let id = chan.info.id.clone();
         if let Some(entry) = &mut self.entry {
-            entry.from = last_post;
+            entry.unread = 0;
+            entry.boundary = None;
         }
         if let Some(server) = self.servers.get_mut(self.server) {
             server.mark_viewed(&id);
@@ -1878,7 +1942,7 @@ pub mod tests {
 
     fn members_viewed_up_to(ms: i64) -> Vec<ChannelMember> {
         let mut members: Vec<ChannelMember> = json("members");
-        members[0].last_viewed_at = ms;
+        members[0].msg_count = ms;
         members[0].mention_count = 0;
         members
     }
@@ -1891,10 +1955,7 @@ pub mod tests {
             .member
             .clone()
             .unwrap();
-        assert_eq!(
-            (member.last_viewed_at, member.mention_count),
-            (1_700_000_060_000, 0)
-        );
+        assert_eq!((member.msg_count, member.mention_count), (2, 0));
         press(&mut app, "K");
         assert!(tabs(&mut app).contains(" #Town Square "));
         app.loaded(
@@ -1902,7 +1963,7 @@ pub mod tests {
             Loaded::Channels {
                 team: TeamId("t1".into()),
                 channels: json("channels"),
-                members: members_viewed_up_to(1_700_000_060_000),
+                members: members_viewed_up_to(2),
                 categories: Some(json("categories")),
             },
         );
@@ -1980,10 +2041,9 @@ pub mod tests {
     #[test]
     fn a_post_elsewhere_flags_its_tab_and_one_in_the_open_channel_does_not() {
         let mut app = fixture();
-        app.servers[0].teams[0].chans.as_mut().unwrap()[0].member = serde_json::from_value(
-            serde_json::json!({"channel_id": "c3", "last_viewed_at": 1_700_000_000_000_i64}),
-        )
-        .unwrap();
+        app.servers[0].teams[0].chans.as_mut().unwrap()[0].member =
+            serde_json::from_value(serde_json::json!({"channel_id": "c3", "msg_count": 0}))
+                .unwrap();
         press(&mut app, "J");
         posted(
             &mut app,
@@ -2899,5 +2959,36 @@ pub mod tests {
         let sent = writes(&sent(&server).await);
         let body: serde_json::Value = serde_json::from_str(&sent[0].1).unwrap();
         assert_eq!(body["message"], "first\n\nsecond");
+    }
+
+    #[test]
+    fn a_channel_the_server_counts_as_read_shows_no_separator_whatever_its_old_timestamps() {
+        let mut app = fixture();
+        app.servers[0].teams[0].chans.as_mut().unwrap()[1]
+            .member
+            .as_mut()
+            .unwrap()
+            .msg_count = 2;
+        enter_town_square(&mut app);
+        assert!(!text(&mut app).contains("new messages"));
+        assert_eq!((app.cursor, app.browsing), (1, false));
+    }
+
+    #[test]
+    fn the_separator_stays_on_its_post_while_new_posts_arrive() {
+        let mut app = fixture();
+        enter_town_square(&mut app);
+        for (n, id) in ["n1", "n2"].into_iter().enumerate() {
+            let ms = 1_700_000_100_000 + n as i64 * 1000;
+            posted(&mut app, post(id, "c1", "u2", "more", ms), &[]);
+        }
+        let shown = text(&mut app);
+        assert_eq!(shown.matches("new messages").count(), 1, "{shown}");
+        let lines: Vec<&str> = shown.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| l.contains("new messages"))
+            .unwrap();
+        assert!(lines[at + 1].contains("hi"), "{shown}");
     }
 }

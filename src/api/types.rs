@@ -60,6 +60,8 @@ pub struct Channel {
     #[serde(default)]
     pub last_post_at: i64,
     #[serde(default)]
+    pub total_msg_count: i64,
+    #[serde(default)]
     pub delete_at: i64,
 }
 
@@ -75,7 +77,7 @@ pub struct NotifyProps {
 pub struct ChannelMember {
     pub channel_id: ChannelId,
     #[serde(default)]
-    pub last_viewed_at: i64,
+    pub msg_count: i64,
     #[serde(default)]
     pub mention_count: i64,
     #[serde(default)]
