@@ -11,11 +11,11 @@ Set Framerate 25
 Set TypingSpeed 70ms
 
 Hide
-Type "export PATH=$PWD/target/release:$PWD/target/release/examples:$PATH; clear"
+Type "export PATH=$PWD/target/release:$PWD/target/release/examples:$PATH; clear; alias mm=demo; clear"
 Enter
 Show
 
-Type "demo"
+Type "mm"
 Sleep 400ms
 Enter
 Sleep 3s
