@@ -2671,6 +2671,7 @@ pub mod tests {
         );
     }
 
+    #[ignore = "needs a local socket and system certificates"]
     #[tokio::test]
     async fn a_whole_session_only_reads_and_views() {
         let (mut app, server) = live().await;
@@ -3134,6 +3135,7 @@ pub mod tests {
         );
     }
 
+    #[ignore = "needs a local socket and system certificates"]
     #[tokio::test]
     async fn empty_and_slash_messages_are_not_sent() {
         let (mut app, _rx, server) = writing().await;
@@ -3321,6 +3323,7 @@ pub mod tests {
         assert!(!screen(&mut app, 80, 14).pop().unwrap().contains("✎"));
     }
 
+    #[ignore = "needs a local socket and system certificates"]
     #[tokio::test]
     async fn a_writing_session_only_makes_the_permitted_writes() {
         let (mut app, mut rx, server) = writing().await;
