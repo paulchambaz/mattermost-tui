@@ -209,6 +209,8 @@ pub struct App {
     pub scroll: usize,
     /// Lines the log should scroll at the next draw, which alone knows where the bottom is.
     pub shift: isize,
+    /// The first and last messages with a line on screen, as of the last draw.
+    pub visible: (usize, usize),
     pub notice: String,
     pub input: Option<Line>,
     pub wizard: Option<Wizard>,
@@ -262,6 +264,7 @@ impl App {
             reactions: false,
             scroll: usize::MAX,
             shift: 0,
+            visible: (0, usize::MAX),
             notice: String::new(),
             input: None,
             wizard: None,
@@ -1279,7 +1282,21 @@ impl App {
         }
     }
 
+    fn snap(&mut self) -> bool {
+        let (first, last) = self.visible;
+        let snapped = self.cursor.clamp(first, last);
+        let moved = snapped != self.cursor;
+        if moved && self.count() > 0 {
+            self.cursor = snapped.min(self.count() - 1);
+            self.browsing = true;
+        }
+        moved
+    }
+
     fn step_up(&mut self) {
+        if self.snap() {
+            return;
+        }
         match (self.browsing, self.cursor) {
             (true, 0) => self.load_older(),
             (true, c) => self.move_cursor(c - 1),
@@ -1332,6 +1349,9 @@ impl App {
     }
 
     fn step_down(&mut self) {
+        if self.snap() {
+            return;
+        }
         match (self.browsing, self.cursor + 1 >= self.count()) {
             (false, _) => {}
             (true, true) => self.browsing = self.selecting,
@@ -2880,6 +2900,33 @@ pub mod tests {
         let id = ChannelId("c3".into());
         assert_eq!(app.servers[0].messages[&id].len(), model::PAGE);
         assert!(!app.servers[0].complete.contains(&id));
+    }
+
+    #[test]
+    fn h_and_l_select_the_nearest_message_on_screen_when_the_selection_is_off_it() {
+        for (key, above) in [("h", false), ("l", false), ("h", true), ("l", true)] {
+            let mut app = fixture();
+            crowd(&mut app, 60);
+            app.reset_view();
+            crate::ui::tests::screen(&mut app, 60, 10);
+            press(&mut app, "h");
+            let selected = app.cursor;
+            press(&mut app, &"k".repeat(40));
+            if above {
+                app.cursor = 0;
+            }
+            crate::ui::tests::screen(&mut app, 60, 10);
+            let (first, last) = app.visible;
+            assert!(first < last, "{:?}", app.visible);
+            assert_eq!(app.cursor, if above { 0 } else { selected });
+            press(&mut app, key);
+            assert_eq!(app.cursor, if above { first } else { last });
+            press(&mut app, "l");
+            assert_eq!(
+                app.cursor,
+                if above { first + 1 } else { (last + 1).min(59) }
+            );
+        }
     }
 
     fn older_requests(sent: &[(String, String, String)]) -> Vec<String> {

@@ -32,7 +32,10 @@ const BINDINGS: &[(&str, &str)] = &[
         "l h",
         "next / previous message; h at the top loads older ones",
     ),
-    ("j k", "scroll the log down / up by a line"),
+    (
+        "j k",
+        "scroll the log down / up by a line; h l then select the nearest message on screen",
+    ),
     ("g G", "first / last message; g also loads older ones"),
     ("w b", "next / previous author group"),
     ("J K", "next / previous channel"),
@@ -980,6 +983,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             scroll = scroll.saturating_add_signed(app.shift).min(bottom);
             app.scroll = scroll;
             app.shift = 0;
+        }
+        let first = log.spans.iter().position(|&(_, end)| end >= scroll);
+        let last = log
+            .spans
+            .iter()
+            .rposition(|&(start, _)| start < scroll + height);
+        if let Some(visible) = first.zip(last) {
+            app.visible = visible;
         }
         percent = (scroll * 100).checked_div(bottom).unwrap_or(100);
         let page: Vec<Line> = log.lines.into_iter().skip(scroll).take(height).collect();

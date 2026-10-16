@@ -55,7 +55,8 @@ Press *?* at any time for the list of keys.
 
 *j k*
 	Scroll the log down and up by a line, without moving the selected
-	message.
+	message. While it is off the screen, *h* and *l* select the nearest
+	message on the screen instead of moving.
 
 *g G*
 	First and last message. *g* also loads older messages.
