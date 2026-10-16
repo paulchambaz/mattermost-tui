@@ -3,13 +3,14 @@ name = "mattermost-tui"
 description = "Keyboard-driven terminal client for Mattermost"
 authors = ["Paul Chambaz <paul.chambaz@tutanota.com>"]
 homepage = "https://github.com/paulchambaz/mattermost-tui"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 include = ["/src/**/*", "/mm.1.scd", "/README.md", "/LICENSE"]
 license = "GPL-3.0-only"
 readme = "README.md"
+documentation = "https://docs.rs/mattermost-tui"
 repository = "https://github.com/paulchambaz/mattermost-tui"
-keywords = ["mattermost", "chat", "tui", "terminal"]
+keywords = ["mattermost", "chat", "tui", "terminal", "client"]
 categories = ["command-line-utilities"]
 
 [dependencies]

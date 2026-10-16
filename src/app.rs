@@ -217,6 +217,8 @@ pub struct App {
     pub pane: Option<Pane>,
     pub size: (u16, u16),
     pub settings: Settings,
+    /// Whether colors are dropped, as `NO_COLOR` asks.
+    pub plain: bool,
     files: Files,
     pub opener: Option<Vec<Item>>,
     editor_fresh: bool,
@@ -265,6 +267,7 @@ impl App {
             settings: Settings::default(),
             files: Files::new(),
             opener: None,
+            plain: false,
             editor_fresh: false,
             awaiting: None,
             drafts: HashMap::new(),
@@ -3303,7 +3306,7 @@ pub mod tests {
         );
     }
 
-    fn ctrl(c: char) -> Msg {
+    pub fn ctrl(c: char) -> Msg {
         Msg::Key(KeyEvent {
             code: KeyCode::Char(c),
             modifiers: KeyModifiers::CONTROL,
@@ -3312,7 +3315,7 @@ pub mod tests {
         })
     }
 
-    fn editor(app: &mut App, body: &str) -> tempfile::TempDir {
+    pub fn editor(app: &mut App, body: &str) -> tempfile::TempDir {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("editor.sh");

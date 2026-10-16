@@ -3,6 +3,7 @@
 use std::time::Instant;
 
 use chrono::Local;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -533,6 +534,10 @@ fn status_line(app: &App, width: usize, percent: usize) -> Line<'static> {
     } else {
         (format!(" {mode}  {}", app.notice), String::new())
     };
+    let right = match width.saturating_sub(right.width()) >= mode.width() + 4 {
+        true => right,
+        false => String::new(),
+    };
     let left = truncate(&left, width.saturating_sub(right.width()));
     let gap = width.saturating_sub(left.width() + right.width());
     Line::styled(
@@ -832,10 +837,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Some(_) => term::split(area.height).1 + 1,
         None => 1,
     };
+    let spare = area.height.saturating_sub(1);
     let [tabs, body, input, status] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(1),
-        Constraint::Length(editor_rows),
+        Constraint::Length(u16::from(spare >= 2)),
+        Constraint::Min(0),
+        Constraint::Length(if spare >= 3 { editor_rows } else { 0 }),
         Constraint::Length(1),
     ])
     .areas(area);
@@ -939,7 +945,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         (.., Some(line)) => Some((String::new(), app.prompt(), line)),
         _ => None,
     };
-    if let Some((label, prompt, line)) = typing {
+    if let Some((label, prompt, line)) = typing.filter(|_| input.height > 0) {
         let lead = 1 + label.width() + prompt.width();
         let (text, column) = visible(&line.shown(), line.cursor(), width.saturating_sub(lead));
         let row = Line::from(vec![
@@ -962,6 +968,22 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         (None, false, None) => status_line(app, width, percent),
     };
     frame.render_widget(Paragraph::new(bottom), status);
+    if app.plain {
+        strip_colors(frame.buffer_mut());
+    }
+}
+
+fn strip_colors(buffer: &mut Buffer) {
+    for cell in buffer.content.iter_mut() {
+        if cell.bg != Color::Reset {
+            cell.modifier.insert(Modifier::REVERSED);
+        }
+        if cell.fg == Color::Indexed(8) {
+            cell.modifier.insert(Modifier::DIM);
+        }
+        cell.fg = Color::Reset;
+        cell.bg = Color::Reset;
+    }
 }
 
 #[cfg(test)]
@@ -997,6 +1019,85 @@ pub mod tests {
 
     fn from_end(lines: &[String], n: usize) -> &str {
         &lines[lines.len() - n]
+    }
+
+    #[test]
+    fn no_screen_breaks_on_a_tiny_terminal() {
+        let scenarios = [
+            "",
+            "?",
+            "f",
+            "x",
+            "o",
+            ":",
+            ":new-server\n",
+            "m",
+            "V",
+            "i",
+            "ihello",
+            "a",
+        ];
+        for (width, height) in [(1, 1), (2, 2), (5, 3), (10, 4), (20, 4), (30, 8)] {
+            for keys in scenarios {
+                let mut app = fixture();
+                for key in keys.split_inclusive('\n') {
+                    match key.strip_suffix('\n') {
+                        Some(text) => {
+                            press(&mut app, text);
+                            press_code(&mut app, ratatui::crossterm::event::KeyCode::Enter);
+                        }
+                        None => press(&mut app, key),
+                    }
+                }
+                let lines = screen(&mut app, width, height);
+                assert_eq!(lines.len(), usize::from(height), "{keys:?}");
+                if height > 1 {
+                    assert!(!from_end(&lines, 1).is_empty(), "{keys:?} {width}x{height}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_editor_pane_leaves_the_conversation_a_row_on_a_short_screen() {
+        for height in [3, 4, 6, 9] {
+            let mut app = fixture();
+            let _dir = crate::app::tests::editor(&mut app, "printf 'EDITING'; sleep 30");
+            app.update(crate::app::tests::ctrl('g'));
+            let lines = screen(&mut app, 20, height);
+            assert_eq!(lines.len(), usize::from(height));
+            assert!(!from_end(&lines, 1).is_empty(), "height {height}");
+            let (conversation, editor) = term::split(height);
+            assert!(conversation >= 1 && editor >= 1, "height {height}");
+        }
+    }
+
+    #[test]
+    fn plain_drops_every_color_and_keeps_the_emphasis() {
+        let mut app = fixture();
+        app.plain = true;
+        press(&mut app, "a");
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert!(buffer
+            .content()
+            .iter()
+            .all(|c| c.fg == Color::Reset && c.bg == Color::Reset));
+        let status = &buffer.content()[buffer.content().len() - 60];
+        assert!(status.modifier.contains(Modifier::REVERSED));
+        assert!(buffer
+            .content()
+            .iter()
+            .any(|c| c.modifier.contains(Modifier::DIM)));
+    }
+
+    #[test]
+    fn the_man_page_describes_every_key_of_the_help() {
+        let page = include_str!("../mm.1.scd");
+        for (key, _) in BINDINGS {
+            assert!(page.contains(&format!("*{key}*")), "{key}");
+        }
     }
 
     #[test]

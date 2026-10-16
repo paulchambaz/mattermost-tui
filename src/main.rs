@@ -16,6 +16,7 @@ mod unread;
 mod ws;
 
 use std::io::Write;
+use std::process::ExitCode;
 
 use anyhow::Result;
 use app::{App, Msg};
@@ -26,8 +27,50 @@ use ratatui::crossterm::execute;
 use ratatui::DefaultTerminal;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 
+const USAGE: &str = "Usage: mm [--help] [--version]
+
+A keyboard-driven terminal client for Mattermost.
+
+  --help       print this help and exit
+  --version    print the version and exit
+
+Press ? inside mm for the keys, and see man mm for the rest.";
+
+/// What the command line asks for.
+#[derive(Debug, PartialEq, Eq)]
+enum Cli {
+    Run,
+    Help,
+    Version,
+    Unknown(String),
+}
+
+fn parse_args(args: impl IntoIterator<Item = String>) -> Cli {
+    match args.into_iter().next().as_deref() {
+        None => Cli::Run,
+        Some("--help" | "-h") => Cli::Help,
+        Some("--version" | "-V") => Cli::Version,
+        Some(other) => Cli::Unknown(other.to_owned()),
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<()> {
+async fn main() -> Result<ExitCode> {
+    match parse_args(std::env::args().skip(1)) {
+        Cli::Run => {}
+        Cli::Help => {
+            println!("{USAGE}");
+            return Ok(ExitCode::SUCCESS);
+        }
+        Cli::Version => {
+            println!("mm {}", env!("CARGO_PKG_VERSION"));
+            return Ok(ExitCode::SUCCESS);
+        }
+        Cli::Unknown(argument) => {
+            eprintln!("mm: unknown argument {argument}\n{USAGE}");
+            return Ok(ExitCode::FAILURE);
+        }
+    }
     let path = config::default_path()?;
     let boot = config::load(&path)?
         .into_iter()
@@ -57,11 +100,12 @@ async fn main() -> Result<()> {
     });
     let mut app = App::new(boot, path, tx);
     app.settings = settings;
+    app.plain = std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
     let result = run(&mut terminal, &mut app, rx).await;
     drop(app);
     let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     ratatui::restore();
-    result
+    result.map(|()| ExitCode::SUCCESS)
 }
 
 async fn run(
@@ -86,4 +130,21 @@ async fn run(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Cli {
+        parse_args(args.iter().map(|a| (*a).to_owned()))
+    }
+
+    #[test]
+    fn arguments_are_read_before_the_terminal_is_touched() {
+        assert_eq!(parse(&[]), Cli::Run);
+        assert_eq!(parse(&["--help"]), Cli::Help);
+        assert_eq!(parse(&["-V"]), Cli::Version);
+        assert_eq!(parse(&["nope"]), Cli::Unknown("nope".into()));
+    }
 }
